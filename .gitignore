@@ -1,6 +1,7 @@
 .env
 *.joblib
 data/raw/*.csv
+data/raw/Zillow Data/
 data/processed/*.csv
 data/processed/*.parquet
 __pycache__/
@@ -8,3 +9,4 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 venv/
+*.pyenv
