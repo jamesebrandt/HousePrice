@@ -1,0 +1,9 @@
+.env
+*.joblib
+data/raw/*.csv
+data/processed/*.csv
+data/processed/*.parquet
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store

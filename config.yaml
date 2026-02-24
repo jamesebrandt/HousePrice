@@ -1,0 +1,68 @@
+search:
+  # Cities where you'd actually consider buying — active listings from these are scored and alerted
+  cities:
+    - "Saratoga Springs"
+    - "Eagle Mountain"
+    - "Lehi"
+    - "American Fork"
+    - "Highland"
+    - "Spanish Fork"
+    - "Mapleton"
+    - "Payson"
+    - "Elk Ridge"
+    - "Heber City"
+    - "Tooele"
+    - "Lake Point"
+    - "Stansbury Park"
+  state: "UT"
+  # Cities to exclude from training and scoring (outliers or places you don't care about)
+  exclude_cities:
+    - "Fountain Green"
+    - "Benjamin"
+  # All downloaded cities — used only to train the model (more sold data = better predictions)
+  training_cities:
+    - "Saratoga Springs"
+    - "Eagle Mountain"
+    - "Lehi"
+    - "American Fork"
+    - "Highland"
+    - "Spanish Fork"
+    - "Mapleton"
+    - "Payson"
+    - "Elk Ridge"
+    - "Heber City"
+    - "Daniel"
+    - "Tooele"
+    - "Lake Point"
+    - "Stansbury Park"
+    - "Grantsville"
+    - "Burmester"
+    - "West Haven"
+    - "Ogden"
+    - "Syracuse"
+    - "Clearfield"
+    - "Nephi"
+
+criteria:
+  max_price: 500000
+  min_beds: 3
+  min_baths: 2.0
+  min_sqft: 1800
+  max_year_built: null          # set to e.g. 2000 if you want only homes built after 2000
+  max_home_age_years: 35        # no homes older than 35 years — set to null to remove this filter
+  min_lot_sqft: 5000
+  max_days_on_market: null      # set to e.g. 30 to only see fresh listings
+
+scoring:
+  min_value_score: 0.05         # flag homes priced 5%+ below predicted value
+  top_n_alerts: 5               # include top N homes in each email alert
+
+notifications:
+  email_to: "your@email.com"    # EDIT THIS
+  email_from: "alerts@gmail.com" # EDIT THIS — use an App Password, not your real password
+
+paths:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  model_path: "models/hedonic_model.joblib"
+  scaler_path: "models/scaler.joblib"
