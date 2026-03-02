@@ -15,10 +15,12 @@ Training strategy:
      so model_diagnostics.py shows out-of-sample figures.
 """
 
+import json
 import logging
 import numpy as np
 import pandas as pd
 import joblib
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -90,8 +92,17 @@ def evaluate_model(model, X_test: np.ndarray, y_test: np.ndarray) -> dict:
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     mae  = mean_absolute_error(y_test, y_pred)
     r2   = r2_score(y_test, y_pred)
-    mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
-    return {"RMSE": rmse, "MAE": mae, "R2": r2, "MAPE_pct": mape}
+    abs_pct = np.abs((y_test - y_pred) / y_test) * 100
+    mape = abs_pct.mean()
+    within_10pct = float((abs_pct <= 10).mean() * 100)
+    within_20pct = float((abs_pct <= 20).mean() * 100)
+    within_30pct = float((abs_pct <= 30).mean() * 100)
+    return {
+        "RMSE": rmse, "MAE": mae, "R2": r2, "MAPE_pct": mape,
+        "within_10pct": within_10pct,
+        "within_20pct": within_20pct,
+        "within_30pct": within_30pct,
+    }
 
 
 def train(
@@ -243,8 +254,36 @@ def train(
         {"X_test": X_holdout, "y_test": y_holdout, "cities": cities_holdout},
         holdout_path,
     )
+
+    # Save a human-readable metrics snapshot alongside the model so the HTML
+    # report can display inline stats without re-running model_diagnostics.py.
+    metrics_payload = {
+        "model_name": best_name,
+        "trained_at": datetime.now().isoformat(timespec="seconds"),
+        "n_training": int(len(X_train)),
+        "n_holdout": int(len(X_holdout)),
+        "holdout_RMSE": float(holdout_metrics["RMSE"]),
+        "holdout_MAE": float(holdout_metrics["MAE"]),
+        "holdout_R2": float(holdout_metrics["R2"]),
+        "holdout_MAPE_pct": float(holdout_metrics["MAPE_pct"]),
+        "holdout_within_10pct": holdout_metrics["within_10pct"],
+        "holdout_within_20pct": holdout_metrics["within_20pct"],
+        "holdout_within_30pct": holdout_metrics["within_30pct"],
+        "cv_results": {
+            k: {
+                "CV_RMSE_mean": float(v["CV_RMSE_mean"]),
+                "CV_RMSE_std":  float(v["CV_RMSE_std"]),
+            }
+            for k, v in results.items()
+        },
+    }
+    metrics_path = model_path.replace(".joblib", "_metrics.json")
+    with open(metrics_path, "w") as _f:
+        json.dump(metrics_payload, _f, indent=2)
+
     logger.info(f"Model saved → {model_path}")
     logger.info(f"Holdout data saved → {holdout_path}")
+    logger.info(f"Metrics saved → {metrics_path}")
 
     return best_model, feature_cols, results
 

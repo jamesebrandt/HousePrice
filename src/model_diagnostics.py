@@ -8,18 +8,15 @@ Layout (3 rows × 3 columns):
     [B] % Prediction Error distribution       — practical accuracy bands
     [C] Feature Importances (top 15)          — what the model actually learned
 
-  Row 2 — What Drives Price (Partial Dependence)
-    [D] Price vs Square Feet                  — most intuitive driver
-    [E] Price vs ZIP Median Income            — wealth / neighbourhood signal
-    [F] Price vs ZHVI (Zillow Home Value)     — market-level appreciation signal
+  Row 2 — Residual Analysis
+    [D] Residuals vs Fitted                   — checks heteroscedasticity & price-level bias
+    [E] Accuracy by Price Tier                — MAPE broken down by quintile (price-range bias)
+    [F] Spatial Residuals (lat/lon)           — geographic clustering of errors
 
-  Row 3 — Location & Bias
+  Row 3 — Location & Normality
     [G] City medians: Actual vs Predicted     — does it nail each market?
     [H] Residuals by City                     — systematic over/under-prediction
     [I] Normal Q-Q Plot                       — are residuals bell-shaped?
-
-Underlying issues for [D] and [E] (e.g. flat curves, odd shapes) are explained
-in diagnostics/DIAGNOSTICS_ISSUES.md.
 
 Run:  python -m src.model_diagnostics
 """
@@ -39,7 +36,6 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 import scipy.stats as stats
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.inspection import partial_dependence
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -137,20 +133,6 @@ def _qq_data(residuals: np.ndarray):
     n = len(residuals)
     q  = np.linspace(0.5 / n, 1 - 0.5 / n, n)
     return stats.norm.ppf(q), np.sort(residuals / residuals.std())
-
-
-def _partial_dep(model, X: np.ndarray, feature_cols: list[str], feat_name: str,
-                 grid_resolution: int = 50):
-    """Return (grid_values, avg_prediction) for a single feature."""
-    if feat_name not in feature_cols:
-        return None, None
-    idx = feature_cols.index(feat_name)
-    try:
-        result = partial_dependence(model, X, features=[idx],
-                                    kind="average", grid_resolution=grid_resolution)
-        return result["grid_values"][0], result["average"][0]
-    except Exception:
-        return None, None
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -262,9 +244,9 @@ def run(
      ax_G, ax_H, ax_I) = axes
 
     row_labels = [
-        ("Row 1 — Core Fit",                     0),
-        ("Row 2 — What Drives Price",             1),
-        ("Row 3 — Location & Bias",               2),
+        ("Row 1 — Core Fit",          0),
+        ("Row 2 — Residual Analysis", 1),
+        ("Row 3 — Location & Bias",   2),
     ]
     for label, row in row_labels:
         fig.text(0.005, 0.965 - row * 0.323, label,
@@ -377,68 +359,145 @@ def run(
                   ha="center", va="center", transform=ax_C.transAxes, fontsize=12)
         ax_C.set_title("[C] Feature Importances", fontweight="bold")
 
-    # ── [D] Partial Dependence: Square Feet ────────────────────────────────────
-    grid_sqft, pd_sqft = _partial_dep(model, X, feature_cols, "sqft")
-    if grid_sqft is not None:
-        ax_D.plot(grid_sqft, pd_sqft / 1e3, color=P["blue"], linewidth=2.5)
-        ax_D.fill_between(grid_sqft, pd_sqft / 1e3 * 0.9, pd_sqft / 1e3 * 1.1,
-                          alpha=0.15, color=P["blue"])
-        ax_D.set_xlabel("Square Feet")
-        ax_D.set_ylabel("Predicted Price ($K)")
-        ax_D.set_title("[D] Price vs Square Feet\n(Partial Dependence — all else equal)",
-                       fontweight="bold")
-        ax_D.text(0.03, 0.97,
-                  "Each point: expected price if\nonly sqft changed, holding\n"
-                  "everything else at its median.",
-                  transform=ax_D.transAxes, va="top", fontsize=8.5,
-                  color=P["dark"],
-                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f0", alpha=0.85))
-    else:
-        ax_D.text(0.5, 0.5, "'sqft' not in feature set",
-                  ha="center", va="center", transform=ax_D.transAxes)
-        ax_D.set_title("[D] Price vs Sq Ft", fontweight="bold")
+    # ── [D] Residuals vs Fitted ─────────────────────────────────────────────────
+    # Standard regression diagnostic: checks for heteroscedasticity (variance
+    # that grows with price) and any price-level bias in predictions.
+    # A good model shows a flat cloud of points centered on the zero line.
+    for city in unique_cities:
+        mask = cities == city
+        ax_D.scatter(y_pred[mask] / 1e3, residuals[mask] / 1e3,
+                     alpha=0.35, s=16, color=city_color_map[city],
+                     edgecolors="none", zorder=3)
 
-    # ── [E] Partial Dependence: ZIP Median Income ──────────────────────────────
-    grid_inc, pd_inc = _partial_dep(model, X, feature_cols, "feat_median_income")
-    if grid_inc is not None and grid_inc.max() > 0:
-        ax_E.plot(grid_inc / 1e3, pd_inc / 1e3, color=P["purple"], linewidth=2.5)
-        ax_E.fill_between(grid_inc / 1e3, pd_inc / 1e3 * 0.9, pd_inc / 1e3 * 1.1,
-                          alpha=0.15, color=P["purple"])
-        ax_E.set_xlabel("ZIP Median Household Income ($K)")
-        ax_E.set_ylabel("Predicted Price ($K)")
-        ax_E.set_title("[E] Price vs ZIP Median Income\n(Partial Dependence)",
-                       fontweight="bold")
-        ax_E.text(0.03, 0.97,
-                  "Wealthier neighbourhoods → higher\nhome prices, even for the same\n"
-                  "physical home features.",
-                  transform=ax_E.transAxes, va="top", fontsize=8.5,
-                  color=P["dark"],
-                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f0", alpha=0.85))
-    else:
-        ax_E.text(0.5, 0.5, "Income feature not available\nor no variation in data",
-                  ha="center", va="center", transform=ax_E.transAxes, fontsize=10)
-        ax_E.set_title("[E] Price vs ZIP Income", fontweight="bold")
+    ax_D.axhline(0, color="red", linestyle="--", linewidth=1.5, label="No error", zorder=4)
+    ax_D.axhspan(-50,  50, alpha=0.06, color=P["green"])
 
-    # ── [F] Partial Dependence: ZHVI Current ───────────────────────────────────
-    grid_zhvi, pd_zhvi = _partial_dep(model, X, feature_cols, "feat_zhvi_current")
-    if grid_zhvi is not None and grid_zhvi.max() > 0:
-        ax_F.plot(grid_zhvi / 1e3, pd_zhvi / 1e3, color=P["green"], linewidth=2.5)
-        ax_F.fill_between(grid_zhvi / 1e3, pd_zhvi / 1e3 * 0.9, pd_zhvi / 1e3 * 1.1,
-                          alpha=0.15, color=P["green"])
-        ax_F.set_xlabel("Zillow Home Value Index ($K, city median)")
-        ax_F.set_ylabel("Predicted Price ($K)")
-        ax_F.set_title("[F] Price vs Zillow HVI\n(Partial Dependence)",
-                       fontweight="bold")
-        ax_F.text(0.03, 0.97,
-                  "ZHVI captures the city's overall\nmarket level — a strong anchor\n"
-                  "for individual home prices.",
-                  transform=ax_F.transAxes, va="top", fontsize=8.5,
-                  color=P["dark"],
-                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f0", alpha=0.85))
+    # Binned mean trend — reveals any systematic curve or funnel
+    _y_sorted_idx = np.argsort(y_pred)
+    _yp_s = y_pred[_y_sorted_idx]
+    _res_s = residuals[_y_sorted_idx]
+    n_bins_D = 16
+    bin_edges_D = np.percentile(_yp_s, np.linspace(5, 95, n_bins_D + 1))
+    bin_edges_D = np.unique(bin_edges_D)
+    bin_x_D, bin_y_D = [], []
+    for _i in range(len(bin_edges_D) - 1):
+        _bm = (_yp_s >= bin_edges_D[_i]) & (_yp_s <= bin_edges_D[_i + 1])
+        if _bm.sum() >= 5:
+            bin_x_D.append(_yp_s[_bm].mean() / 1e3)
+            bin_y_D.append(_res_s[_bm].mean() / 1e3)
+    if bin_x_D:
+        ax_D.plot(bin_x_D, bin_y_D, "k-", linewidth=2.5,
+                  label="Binned mean trend", zorder=5, alpha=0.85)
+
+    ax_D.set_xlabel("Fitted (Predicted) Price ($K)")
+    ax_D.set_ylabel("Residual ($K)  [Predicted − Actual]")
+    ax_D.set_title("[D] Residuals vs Fitted\n(Flat trend = no price-level bias; even spread = homoscedastic)",
+                   fontweight="bold")
+    ax_D.legend(fontsize=8, loc="upper left")
+    ax_D.text(0.97, 0.97,
+              "✓ Good: flat cloud near 0\n✗ Bad: funnel = heteroscedastic\n"
+              "   curve = price-level bias",
+              transform=ax_D.transAxes, ha="right", va="top", fontsize=8.5,
+              color=P["dark"],
+              bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f0", alpha=0.85))
+
+    # ── [E] Accuracy by Price Tier ──────────────────────────────────────────────
+    # Breaks MAPE down by price quintile to reveal any price-range bias —
+    # a common failure mode in hedonic models where cheap/expensive homes
+    # are harder to predict. Bars should be roughly even across tiers.
+    n_tiers = 5
+    tier_bounds = np.percentile(y, np.linspace(0, 100, n_tiers + 1))
+    tier_idx = np.searchsorted(tier_bounds[1:-1], y)   # 0 … n_tiers-1
+
+    tier_mapes, tier_w10, tier_w20, tier_ns = [], [], [], []
+    for t in range(n_tiers):
+        t_mask = tier_idx == t
+        n_t = int(t_mask.sum())
+        if n_t > 0:
+            t_mape = abs_pct[t_mask].mean()
+            t_w10  = float((abs_pct[t_mask] <= 10).mean() * 100)
+            t_w20  = float((abs_pct[t_mask] <= 20).mean() * 100)
+        else:
+            t_mape = t_w10 = t_w20 = 0.0
+        tier_mapes.append(t_mape)
+        tier_w10.append(t_w10)
+        tier_w20.append(t_w20)
+        tier_ns.append(n_t)
+
+    tier_labels = [
+        f"Q{t+1}\n${tier_bounds[t]/1e3:.0f}K–\n${tier_bounds[t+1]/1e3:.0f}K"
+        for t in range(n_tiers)
+    ]
+    bar_cols_E = [
+        P["green"] if m <= 10 else P["orange"] if m <= 20 else P["red"]
+        for m in tier_mapes
+    ]
+    ax_E.bar(range(n_tiers), tier_mapes, color=bar_cols_E,
+             edgecolor="white", width=0.65, alpha=0.85)
+    ax_E.axhline(10, color=P["gray"], linestyle="--", linewidth=1,
+                 alpha=0.8, label="10 % threshold", zorder=4)
+
+    for t, (tm, tw10, tw20, n) in enumerate(zip(tier_mapes, tier_w10, tier_w20, tier_ns)):
+        ax_E.text(t, tm + 0.4,
+                  f"±10: {tw10:.0f}%\n±20: {tw20:.0f}%\nn={n}",
+                  ha="center", va="bottom", fontsize=7, color=P["dark"])
+
+    ax_E.set_xticks(range(n_tiers))
+    ax_E.set_xticklabels(tier_labels, fontsize=7.5)
+    ax_E.set_xlabel("Price Quintile (Actual Price)")
+    ax_E.set_ylabel("MAPE (%)")
+    ax_E.set_title("[E] Accuracy by Price Tier\n(Even bars = no price-range bias)",
+                   fontweight="bold")
+    ax_E.legend(fontsize=8)
+    ax_E.text(0.97, 0.97,
+              f"Overall MAPE: {mape:.1f}%\nBar labels: % of listings\nwithin ±10 % / ±20 %",
+              transform=ax_E.transAxes, ha="right", va="top", fontsize=8.5,
+              color=P["dark"],
+              bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f0", alpha=0.85))
+
+    # ── [F] Spatial Residuals (lat/lon) ────────────────────────────────────────
+    # Plots each listing by its GPS coordinates and colours it by prediction
+    # error. Clusters of the same colour reveal geographic bias — location
+    # sub-markets the model has not fully captured (e.g. a particular
+    # subdivision that commands a premium not explained by the features).
+    lat_idx = feature_cols.index("latitude")  if "latitude"  in feature_cols else None
+    lon_idx = feature_cols.index("longitude") if "longitude" in feature_cols else None
+
+    if lat_idx is not None and lon_idx is not None:
+        lat_F = X[:, lat_idx].astype(float)
+        lon_F = X[:, lon_idx].astype(float)
+        valid_F = (
+            np.isfinite(lat_F) & np.isfinite(lon_F) &
+            (lat_F != 0) & (lon_F != 0)
+        )
+        if valid_F.sum() >= 10:
+            res_k = residuals[valid_F] / 1e3
+            vmax_F = float(np.percentile(np.abs(res_k), 90))
+            sc_F = ax_F.scatter(
+                lon_F[valid_F], lat_F[valid_F], c=res_k,
+                cmap="RdBu_r", vmin=-vmax_F, vmax=vmax_F,
+                alpha=0.65, s=22, edgecolors="none", zorder=3,
+            )
+            plt.colorbar(sc_F, ax=ax_F, label="Residual ($K)",
+                         shrink=0.75, pad=0.02)
+            ax_F.set_xlabel("Longitude")
+            ax_F.set_ylabel("Latitude")
+            ax_F.set_title("[F] Spatial Residuals\n(Clustered blue/red = geographic bias)",
+                           fontweight="bold")
+            ax_F.text(0.03, 0.97,
+                      "Blue: model over-predicts\nRed: model under-predicts\n"
+                      "Clusters → location bias\nnot captured by features.",
+                      transform=ax_F.transAxes, va="top", fontsize=8.5,
+                      color=P["dark"],
+                      bbox=dict(boxstyle="round,pad=0.3", facecolor="#f0f0f0", alpha=0.85))
+        else:
+            ax_F.text(0.5, 0.5, "Insufficient valid\nlat/lon coordinates",
+                      ha="center", va="center", transform=ax_F.transAxes, fontsize=11)
+            ax_F.set_title("[F] Spatial Residuals", fontweight="bold")
     else:
-        ax_F.text(0.5, 0.5, "ZHVI feature not available",
-                  ha="center", va="center", transform=ax_F.transAxes, fontsize=10)
-        ax_F.set_title("[F] Price vs ZHVI", fontweight="bold")
+        ax_F.text(0.5, 0.5, "latitude/longitude not\nin feature set",
+                  ha="center", va="center", transform=ax_F.transAxes, fontsize=11)
+        ax_F.set_title("[F] Spatial Residuals", fontweight="bold")
 
     # ── [G] City Actual vs Predicted median prices ─────────────────────────────
     city_summary = []

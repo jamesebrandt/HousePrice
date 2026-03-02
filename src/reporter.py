@@ -10,6 +10,7 @@ Usage:
 """
 
 import base64
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,145 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_DIAGNOSTICS_PNG = Path(__file__).parent.parent / "diagnostics" / "model_diagnostics.png"
+_DIAGNOSTICS_PNG     = Path(__file__).parent.parent / "diagnostics" / "model_diagnostics.png"
+_DEFAULT_METRICS_PATH = Path(__file__).parent.parent / "models" / "hedonic_model_metrics.json"
+
+
+def _load_model_metrics(metrics_path: Path = _DEFAULT_METRICS_PATH) -> dict | None:
+    """Load saved model metrics JSON; returns None if not found."""
+    try:
+        with open(metrics_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _metrics_cards_html(m: dict) -> str:
+    """Render a row of KPI-style cards from a metrics dict."""
+    r2   = m.get("holdout_R2", m.get("R2"))
+    rmse = m.get("holdout_RMSE", m.get("RMSE"))
+    mae  = m.get("holdout_MAE",  m.get("MAE"))
+    mape = m.get("holdout_MAPE_pct", m.get("MAPE_pct"))
+    w10  = m.get("holdout_within_10pct")
+    w20  = m.get("holdout_within_20pct")
+    w30  = m.get("holdout_within_30pct")
+
+    def _card(value: str, label: str, color: str = "#2c3e50") -> str:
+        return (
+            f'<div class="diag-metric-card">'
+            f'<div class="diag-metric-value" style="color:{color};">{value}</div>'
+            f'<div class="diag-metric-label">{label}</div>'
+            f'</div>'
+        )
+
+    cards = []
+    if r2   is not None: cards.append(_card(f"{r2:.3f}",              "R² (holdout)",        "#2980b9"))
+    if rmse is not None: cards.append(_card(f"${rmse/1e3:.0f}K",      "RMSE (holdout)",      "#e74c3c"))
+    if mae  is not None: cards.append(_card(f"${mae/1e3:.0f}K",       "MAE (holdout)",       "#e67e22"))
+    if mape is not None: cards.append(_card(f"{mape:.1f}%",            "MAPE (holdout)",      "#8e44ad"))
+    if w10  is not None: cards.append(_card(f"{w10:.0f}%",             "Within ±10%",         "#27ae60"))
+    if w20  is not None: cards.append(_card(f"{w20:.0f}%",             "Within ±20%",         "#16a085"))
+    if w30  is not None: cards.append(_card(f"{w30:.0f}%",             "Within ±30%",         "#95a5a6"))
+    return '<div class="diag-metrics-row">' + "".join(cards) + '</div>'
+
+
+def _model_info_html(m: dict) -> str:
+    """Render a single-line model info banner."""
+    name  = m.get("model_name", "—")
+    date  = m.get("trained_at", "—")[:10] if m.get("trained_at") else "—"
+    n_tr  = m.get("n_training")
+    n_ho  = m.get("n_holdout")
+    n_str = f"{n_tr:,} training + {n_ho:,} holdout" if n_tr and n_ho else "—"
+    cv = m.get("cv_results", {})
+    cv_lines = "  ·  ".join(
+        f"{k}: ${v['CV_RMSE_mean']/1e3:.0f}K ± ${v['CV_RMSE_std']/1e3:.0f}K"
+        for k, v in cv.items()
+        if "CV_RMSE_mean" in v
+    )
+    return (
+        f'<div class="diag-model-info">'
+        f'<strong>Algorithm:</strong> {name}&emsp;'
+        f'<strong>Trained:</strong> {date}&emsp;'
+        f'<strong>Data:</strong> {n_str}'
+        + (f'&emsp;<strong>CV RMSE:</strong> {cv_lines}' if cv_lines else "")
+        + '</div>'
+    )
+
+
+_PANEL_GUIDE = [
+    ("[A] Predicted vs Actual",
+     "Points should cluster tightly along the dashed diagonal. Dots far from the line "
+     "are large individual errors. Coloured by city — systematic offsets for one city "
+     "indicate location-level bias. The ±20 % green band shows the practical accuracy zone."),
+
+    ("[B] Prediction Error Distribution",
+     "Shows how often predictions fall within ±10 / ±20 / ±30 % of the listing price. "
+     "A tight bell centred on 0 is ideal. A rightward shift means the model systematically "
+     "over-predicts (listings appear cheaper than predicted); a leftward shift means "
+     "under-predicting."),
+
+    ("[C] Feature Importances",
+     "Gini-based importance for tree models (RandomForest / XGBoost); coefficient magnitude "
+     "for Ridge. The top 15 features are shown, colour-coded by category. Location dummies "
+     "(city / ZIP) often dominate — this is expected because real estate is highly "
+     "location-dependent."),
+
+    ("[D] Residuals vs Fitted",
+     "A fundamental regression diagnostic. The x-axis is the model's prediction; the y-axis "
+     "is the error (predicted − actual). A good model shows a flat, uniform cloud centred "
+     "on the red zero line. A funnel shape (variance growing with price) signals "
+     "heteroscedasticity. A curved binned-mean trend line indicates price-level bias — the "
+     "model over-predicts cheap homes and under-predicts expensive ones, or vice-versa."),
+
+    ("[E] Accuracy by Price Tier",
+     "MAPE broken down by price quintile (Q1 = cheapest, Q5 = most expensive). Even bar "
+     "heights mean the model is equally reliable across the price spectrum. A tall bar for "
+     "Q5 is common — luxury homes have more idiosyncratic features and fewer comparable "
+     "sales. Bar annotations show the % of listings within ±10 % and ±20 % for each tier."),
+
+    ("[F] Spatial Residuals",
+     "Each listing is plotted at its GPS coordinates and coloured by prediction error "
+     "(blue = model over-predicts, red = model under-predicts). Random scatter is ideal. "
+     "Geographic clusters of the same colour reveal location sub-markets — specific "
+     "neighbourhoods or subdivisions — whose premiums are not fully captured by the current "
+     "feature set. Adding more granular location features (sub-ZIP codes, school district "
+     "ratings) can reduce this clustering."),
+
+    ("[G] City Medians: Actual vs Predicted",
+     "Paired bars comparing median actual vs. median predicted price for each city. "
+     "Bars of equal length indicate low city-level bias. Large gaps mean the model "
+     "systematically over- or under-prices that entire market, which can cause false "
+     "deal signals for listings in that city."),
+
+    ("[H] Residuals by City",
+     "Box plots of residuals (predicted − actual) for each city. The red dashed line "
+     "at 0 is the no-bias target. A box centred on 0 is ideal. A city whose median is "
+     "far from 0 has systematic bias; wide boxes indicate high variance, which may "
+     "simply reflect genuine price diversity in that market."),
+
+    ("[I] Normal Q-Q Plot",
+     "Tests whether residuals follow a Normal distribution. Points should fall along "
+     "the red reference line. An S-curve indicates heavy tails (large errors are more "
+     "common than a Normal distribution would predict). Tree-based models do not require "
+     "normally distributed residuals for valid predictions, but heavy tails warn that "
+     "some listings will have very large errors."),
+]
+
+
+def _panel_guide_html() -> str:
+    items = "".join(
+        f'<div class="panel-guide-item">'
+        f'<div class="panel-guide-label">{label}</div>'
+        f'<div class="panel-guide-desc">{desc}</div>'
+        f'</div>'
+        for label, desc in _PANEL_GUIDE
+    )
+    return (
+        '<div class="panel-guide">'
+        '<div class="panel-guide-title">Reading the Diagnostic Panels</div>'
+        f'<div class="panel-guide-grid">{items}</div>'
+        '</div>'
+    )
 
 
 def _fmt_price(val) -> str:
@@ -87,16 +226,18 @@ def _deal_cards(deals: pd.DataFrame) -> str:
         adu_likely = row.get("adu_likely", False)
         adu_conf = row.get("adu_confidence", 0)
         adu_rent = row.get("estimated_adu_rent", 0)
+        adu_beds = int(row.get("estimated_adu_beds", 0))
         mortgage = row.get("estimated_mortgage", 0)
         net_cost = row.get("net_monthly_cost", 0)
 
         adu_html = ""
         if adu_likely:
             conf_pct = f"{adu_conf * 100:.0f}%" if adu_conf else "—"
+            bed_str = f"~{adu_beds}bd " if adu_beds else ""
             adu_html = f"""
               <div class="adu-badge">
                 <span class="adu-tag">ADU Potential</span>
-                <span class="adu-detail">~${adu_rent:,.0f}/mo rent · ${mortgage:,.0f}/mo mortgage · <strong>${net_cost:,.0f}/mo net</strong> · {conf_pct} confidence</span>
+                <span class="adu-detail">{bed_str}~${adu_rent:,.0f}/mo rent · ${mortgage:,.0f}/mo mortgage · <strong>${net_cost:,.0f}/mo net</strong> · {conf_pct} confidence</span>
               </div>"""
 
         link_btn = (
@@ -181,7 +322,9 @@ def _listings_table(df: pd.DataFrame) -> str:
         if row.get("adu_likely", False):
             rent_est = row.get("estimated_adu_rent", 0)
             net_est = row.get("net_monthly_cost", 0)
-            adu_cell = f'<span class="adu-table-tag">${rent_est:,.0f}/mo → ${net_est:,.0f} net</span>'
+            t_adu_beds = int(row.get("estimated_adu_beds", 0))
+            bed_lbl = f"{t_adu_beds}bd " if t_adu_beds else ""
+            adu_cell = f'<span class="adu-table-tag">{bed_lbl}${rent_est:,.0f}/mo → ${net_est:,.0f} net</span>'
         else:
             adu_cell = "—"
 
@@ -241,11 +384,16 @@ def build_html_report(
 
     png_path = Path(diagnostics_png_path) if diagnostics_png_path else _DIAGNOSTICS_PNG
     png_b64 = _encode_png(png_path)
-    diag_section = (
+    diag_img_html = (
         f'<img src="data:image/png;base64,{png_b64}" alt="Model diagnostics" class="diag-img">'
         if png_b64
         else '<p class="no-diag">Diagnostics image not found. Run: <code>python -m src.model_diagnostics</code></p>'
     )
+
+    # Load saved model metrics for inline display
+    metrics = _load_model_metrics()
+    metrics_html = _metrics_cards_html(metrics) if metrics else ""
+    model_info_html = _model_info_html(metrics) if metrics else ""
 
     n_scored = len(filtered_df)
     n_deals = len(deals_df)
@@ -453,10 +601,63 @@ def build_html_report(
       border-radius: 10px;
       padding: 24px;
       box-shadow: 0 1px 4px rgba(0,0,0,0.07);
-      text-align: center;
     }}
-    .diag-img {{ max-width: 100%; border-radius: 6px; }}
-    .no-diag {{ color: #7f8c8d; font-style: italic; }}
+    .diag-img {{ max-width: 100%; border-radius: 6px; display: block; margin: 0 auto; }}
+    .no-diag {{ color: #7f8c8d; font-style: italic; text-align: center; }}
+
+    /* Inline metrics row */
+    .diag-metrics-row {{
+      display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px;
+    }}
+    .diag-metric-card {{
+      flex: 1; min-width: 100px; text-align: center;
+      padding: 10px 14px; background: #f8f9fa;
+      border-radius: 8px; border: 1px solid #e9ecef;
+    }}
+    .diag-metric-value {{ font-size: 20px; font-weight: 700; }}
+    .diag-metric-label {{ font-size: 11px; color: #7f8c8d; margin-top: 2px;
+      text-transform: uppercase; letter-spacing: 0.4px; }}
+
+    /* Model info bar */
+    .diag-model-info {{
+      font-size: 12.5px; color: #555; background: #f8f9fa;
+      border: 1px solid #e9ecef; border-radius: 6px;
+      padding: 8px 14px; margin-bottom: 18px;
+    }}
+
+    /* PNG wrapper */
+    .diag-img-section {{ margin-bottom: 28px; }}
+
+    /* Panel guide */
+    .panel-guide {{
+      background: #f8f9fa; border: 1px solid #e9ecef;
+      border-radius: 8px; padding: 18px 20px; margin-top: 24px;
+    }}
+    .panel-guide-title {{
+      font-size: 15px; font-weight: 700; color: #2c3e50;
+      margin-bottom: 14px; padding-bottom: 8px;
+      border-bottom: 1px solid #e0e4ea;
+    }}
+    .panel-guide-grid {{
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 14px;
+    }}
+    .panel-guide-item {{
+      background: white; border-radius: 6px; padding: 12px 14px;
+      border: 1px solid #e9ecef;
+    }}
+    .panel-guide-label {{
+      font-size: 12.5px; font-weight: 700; color: #2980b9; margin-bottom: 5px;
+    }}
+    .panel-guide-desc {{ font-size: 12px; color: #555; line-height: 1.55; }}
+
+    /* Methodology note */
+    .methodology-note {{
+      background: #fff8e1; border-left: 4px solid #f39c12;
+      border-radius: 4px; padding: 12px 16px; margin-top: 20px;
+      font-size: 13px; color: #5d4037; line-height: 1.6;
+    }}
+    .methodology-note strong {{ color: #e67e22; }}
 
     /* ── Cities note ── */
     .cities-note {{
@@ -573,7 +774,29 @@ def build_html_report(
   <div id="tab-diagnostics" class="tab-panel">
     <h2 class="section-title">Model Diagnostics</h2>
     <div class="diag-wrap">
-      {diag_section}
+
+      {metrics_html}
+      {model_info_html}
+
+      <div class="diag-img-section">
+        {diag_img_html}
+      </div>
+
+      {_panel_guide_html()}
+
+      <div class="methodology-note">
+        <strong>Important — What This Model Predicts:</strong>
+        Utah MLS rules prohibit Redfin from publishing confirmed sale prices, so the
+        <em>PRICE</em> column in sold exports is blank for Utah listings. This model
+        is therefore trained on <strong>list (asking) prices</strong>, not transaction
+        values. A high value score means a listing is priced below what comparable
+        homes are <em>asking</em> in the current market — not below appraisal value.
+        Underpriced listings relative to asking-price comps are still genuine signals
+        (motivated sellers, quick-sale situations, condition discounts), but the model
+        cannot confirm a home is below its appraised or intrinsic value without
+        access to confirmed sale prices from a paid MLS feed.
+      </div>
+
     </div>
   </div>
 
