@@ -72,6 +72,8 @@ CITY_TO_COUNTY_FIPS: dict[str, str] = {
     "santaquin":        "049",
     "orem":             "049",
     "provo":            "049",
+    "salem":            "049",
+    "alpine":           "049",
     # Salt Lake County (035)
     "salt lake city":   "035",
     "south salt lake":  "035",
@@ -125,6 +127,7 @@ CITY_TO_COUNTY_FIPS: dict[str, str] = {
     "fountain green":   "039",
     "manti":            "039",
     "ephraim":          "039",
+    "wales":            "039",
     # Summit County (043)
     "park city":        "043",
     # Washington County (053)

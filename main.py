@@ -246,7 +246,7 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
         logger.warning("No active listings found in target cities after filtering.")
         return
 
-    predicted = predict(model, feature_cols, active_df)
+    predicted = predict(model, feature_cols, active_df, model_path=model_path)
     scored_df = compute_value_scores(active_df, predicted)
     logger.info(score_summary(scored_df))
 
@@ -311,6 +311,7 @@ def main():
     parser.add_argument("--no-report", action="store_true", help="Skip saving the HTML report to reports/.")
     parser.add_argument("--use-sample", action="store_true", help="Use generated sample data instead of live Redfin fetch.")
     parser.add_argument("--refetch", action="store_true", help="Force live Redfin API fetch even if cached CSVs exist.")
+    parser.add_argument("--serve", action="store_true", help="Serve the HTML report locally after running.")
     parser.add_argument("--config", default="config.yaml", help="Path to config YAML (default: config.yaml).")
     parser.add_argument("--time", default="07:00", help="Daily run time in HH:MM format (default: 07:00).")
     args = parser.parse_args()
@@ -324,6 +325,51 @@ def main():
         run_pipeline(config_path=args.config, retrain=args.retrain,
                      send_email=send_email_flag, use_sample=use_sample_flag,
                      refetch=refetch_flag, export_report=export_report_flag)
+
+    if args.serve:
+        import http.server
+        import socketserver
+        import os
+
+        start_port = 8000
+        end_port = 8010
+        web_dir = Path("reports")
+        
+        if not web_dir.exists():
+            logger.error(f"Reports directory {web_dir} does not exist. Run with --run-now first.")
+            sys.exit(1)
+
+        # Change to the reports directory to serve files from there
+        os.chdir(web_dir)
+        
+        Handler = http.server.SimpleHTTPRequestHandler
+        # Allow reusing the address to avoid "Address already in use" errors
+        socketserver.TCPServer.allow_reuse_address = True
+        
+        server_started = False
+        for port in range(start_port, end_port + 1):
+            try:
+                with socketserver.TCPServer(("", port), Handler) as httpd:
+                    report_name = f"home_finder_{datetime.now().strftime('%Y-%m-%d')}.html"
+                    print(f"\nServing reports at http://localhost:{port}")
+                    print(f"Latest report: http://localhost:{port}/{report_name}")
+                    print("Press Ctrl+C to stop serving.")
+                    httpd.serve_forever()
+                    server_started = True
+                    break
+            except OSError as e:
+                if e.errno == 48: # Address already in use
+                    logger.warning(f"Port {port} is already in use. Trying next port...")
+                    continue
+                else:
+                    raise
+            except KeyboardInterrupt:
+                print("\nServer stopped.")
+                server_started = True # Handled gracefully
+                break
+        
+        if not server_started:
+             logger.error(f"Could not find an open port between {start_port} and {end_port}. Please free up a port and try again.")
 
     if args.schedule:
         schedule.every().day.at(args.time).do(
@@ -343,7 +389,7 @@ def main():
         except KeyboardInterrupt:
             logger.info("Scheduler stopped.")
 
-    if not args.run_now and not args.schedule:
+    if not args.run_now and not args.schedule and not args.serve:
         parser.print_help()
         sys.exit(1)
 

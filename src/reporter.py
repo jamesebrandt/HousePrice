@@ -240,6 +240,15 @@ def _deal_cards(deals: pd.DataFrame) -> str:
                 <span class="adu-detail">{bed_str}~${adu_rent:,.0f}/mo rent · ${mortgage:,.0f}/mo mortgage · <strong>${net_cost:,.0f}/mo net</strong> · {conf_pct} confidence</span>
               </div>"""
 
+        confidence_html = ""
+        if row.get("low_confidence"):
+            reason = row.get("confidence_reason", "unusual property")
+            confidence_html = f"""
+              <div class="adu-badge" style="margin-top:4px;">
+                <span class="adu-tag" style="background:#e67e22;">Low Confidence</span>
+                <span class="adu-detail" style="color:#e67e22;">{reason} — model prediction may be unreliable</span>
+              </div>"""
+
         link_btn = (
             f'<a href="{url}" target="_blank" class="redfin-btn">View on Redfin ↗</a>'
             if url != "#" else ""
@@ -261,7 +270,7 @@ def _deal_cards(deals: pd.DataFrame) -> str:
               <div class="deal-badge" style="background:{badge_bg};">{pct_below_str} below market</div>
               <div class="deal-details">
                 {beds}bd / {baths}ba &nbsp;·&nbsp; {sqft} sqft &nbsp;·&nbsp; Built {year} &nbsp;·&nbsp; {dom} days on mkt
-              </div>{adu_html}
+              </div>{adu_html}{confidence_html}
               <div class="deal-score">Composite score: <strong>{score}</strong></div>
             </div>
           </div>

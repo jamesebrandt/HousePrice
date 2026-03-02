@@ -73,6 +73,15 @@ def build_html_email(df: pd.DataFrame, run_date: str = None) -> str:
                 f'ADU ~${adu_rent:,.0f}/mo</span>'
             )
 
+        confidence_html = ""
+        if row.get("low_confidence"):
+            reason = row.get("confidence_reason", "unusual property")
+            confidence_html = (
+                '<br><span style="background:#e67e22;color:white;padding:2px 8px;'
+                'border-radius:10px;font-size:10px;font-weight:bold;">'
+                f'Low confidence: {reason}</span>'
+            )
+
         rows_html += f"""
         <tr style="border-bottom: 1px solid #eee;">
           <td style="padding: 14px 10px;">
@@ -92,7 +101,7 @@ def build_html_email(df: pd.DataFrame, run_date: str = None) -> str:
             {beds}bd / {baths}ba<br>
             {sqft} sqft<br>
             Built {year}<br>
-            {dom} days on mkt{adu_html}
+            {dom} days on mkt{adu_html}{confidence_html}
           </td>
           <td style="padding: 14px 10px; text-align:center; font-size:13px; color:#555;">
             {score}
@@ -321,11 +330,15 @@ def print_deals_to_console(df: pd.DataFrame) -> None:
         print(f"  Beds/Baths: {row.get('beds')}bd / {row.get('baths')}ba  |  Sqft: {row.get('sqft', '?')}")
         if row.get("adu_likely", False):
             adu_rent = row.get("estimated_adu_rent", 0)
+            adu_beds = int(row.get("estimated_adu_beds", 0))
             mortgage = row.get("estimated_mortgage", 0)
             net = row.get("net_monthly_cost", 0)
             conf = row.get("adu_confidence", 0) * 100
-            print(f"  ADU:       ~${adu_rent:,.0f}/mo rent  |  Mortgage: ${mortgage:,.0f}/mo  |  Net: ${net:,.0f}/mo  ({conf:.0f}% confidence)")
+            bed_str = f"~{adu_beds}bd" if adu_beds else ""
+            print(f"  ADU:       {bed_str} ~${adu_rent:,.0f}/mo rent  |  Mortgage: ${mortgage:,.0f}/mo  |  Net: ${net:,.0f}/mo  ({conf:.0f}% confidence)")
         print(f"  Composite Score: {row.get('composite_score', 0):.3f}")
+        if row.get("low_confidence"):
+            print(f"  *** LOW CONFIDENCE: {row.get('confidence_reason', 'unusual property')} ***")
         if row.get("url"):
             print(f"  URL: {row['url']}")
     print("\n" + "=" * 70)

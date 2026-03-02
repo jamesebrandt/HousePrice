@@ -32,18 +32,38 @@ search:
     - "Lehi"
     - "American Fork"
     - "Highland"
+    - "Cedar Hills"
+    - "Pleasant Grove"
+    - "Lindon"
+    - "Vineyard"
     - "Spanish Fork"
     - "Mapleton"
+    - "Springville"
     - "Payson"
     - "Elk Ridge"
+    - "Salem"
+    - "Orem"
+    - "Provo"
     - "Heber City"
     - "Daniel"
     - "Tooele"
     - "Lake Point"
     - "Stansbury Park"
+    - "Erda"
     - "Grantsville"
     - "Burmester"
     - "Nephi"
+    - "Riverton"
+    - "Bluffdale"
+    - "Herriman"
+    - "South Jordan"
+    - "Alpine"
+
+training:
+  # Cap training data to homes at or below this price. Homes well above
+  # your criteria.max_price add noise without improving predictions for
+  # the price range you actually care about. Set to null to disable.
+  max_price: 1200000
 
 criteria:
   max_price: 800000

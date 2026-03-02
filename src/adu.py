@@ -9,16 +9,17 @@ apartment using two complementary signals:
      "separate entrance", "kitchenette", "rental income", etc.
 
   2. **Structural heuristics** from numeric fields (weaker but always available)
-     High bath-to-bed ratios, large sqft relative to bed count, and
-     extra bathrooms beyond what a typical home would have.
+     High bed+bath totals, excess bathrooms beyond a typical single-family home,
+     large sqft relative to bed count, and other patterns that suggest a
+     separate living unit is present.
 
-The combined confidence (0.0–1.0) feeds into:
-  - `estimated_adu_rent`: ZIP-level or config-based monthly rent estimate
-  - `estimated_mortgage`: standard 30-year fixed from FRED rate data
-  - `net_monthly_cost`: mortgage minus ADU rent offset
+The combined confidence (0.0–1.0) gates detection (is there an ADU?).
+Rent is estimated independently based on the *inferred size* of the ADU
+(bed/bath count, sqft), not scaled by confidence.
 """
 
 import logging
+import math
 import re
 from pathlib import Path
 
@@ -53,10 +54,17 @@ _ADU_KEYWORDS = [
     r"lower[\s\-]?level\s+(apartment|suite|unit|living|rental)",
     r"walkout\s+(basement|apartment|suite|rental)",
     r"finished\s+basement\s+with\s+(kitchen|bath|bedroom|separate)",
+    r"full\s+(kitchen|apartment)\s+in\s+(the\s+)?basement",
+    r"basement\s+has\s+(its\s+own|a\s+separate|full)",
+    r"(upstairs|downstairs|lower|upper)\s+unit",
+    r"tenant",
+    r"(live[\s\-]?in|rented|currently\s+renting)",
+    r"separate\s+(laundry|washer|dryer|w/d)",
+    r"(rambler|home)\s+with\s+(rental|income|apartment)",
 ]
 _ADU_PATTERN = re.compile("|".join(_ADU_KEYWORDS), re.IGNORECASE)
 
-# Strong signals get extra weight
+# Strong signals get extra weight — these almost always mean a real ADU
 _STRONG_KEYWORDS = [
     r"\badu\b",
     r"accessory\s+dwelling",
@@ -69,6 +77,9 @@ _STRONG_KEYWORDS = [
     r"second\s+kitchen",
     r"2nd\s+kitchen",
     r"two\s+kitchen",
+    r"full\s+(kitchen|apartment)\s+in\s+(the\s+)?basement",
+    r"tenant",
+    r"currently\s+renting",
 ]
 _STRONG_PATTERN = re.compile("|".join(_STRONG_KEYWORDS), re.IGNORECASE)
 
@@ -83,43 +94,75 @@ def _keyword_score(description: str) -> float:
 
     if not matches:
         return 0.0
+
+    # Any strong keyword is high-confidence; multiple strong keywords is near-certain
+    if len(strong) >= 3:
+        return 1.0
+    if len(strong) >= 2:
+        return min(0.7 + 0.1 * len(matches), 1.0)
     if strong:
-        return min(0.5 + 0.15 * len(strong), 1.0)
-    return min(0.25 + 0.1 * len(matches), 0.7)
+        return min(0.55 + 0.1 * len(matches), 0.95)
+
+    # Weak keywords only — suggestive but not conclusive
+    return min(0.25 + 0.1 * len(matches), 0.65)
 
 
 def _structural_score(row: pd.Series) -> float:
     """
-    Score 0.0–0.5 based on structural indicators that suggest ADU potential.
-    Capped at 0.5 because structure alone is a weak signal.
+    Score 0.0–1.0 based on structural indicators that suggest an ADU.
+
+    Key heuristics:
+      - Excess rooms:  A 9bd/6ba home almost certainly has a separate unit.
+        Normal single-family homes rarely exceed 5bd/3.5ba.
+      - Bath density:  >=1 bath per bed is unusual for single-family.
+      - Large footprint with many rooms: 4000+ sqft with 7+ beds.
+      - Excess baths:  More baths than expected for the bed count suggests
+        a second full bathroom set (i.e. a separate unit).
     """
     score = 0.0
     beds = row.get("beds")
     baths = row.get("baths")
     sqft = row.get("sqft")
 
-    if pd.notna(beds) and pd.notna(baths) and beds > 0:
-        bath_ratio = baths / beds
-        if bath_ratio >= 1.0:
-            score += 0.15
-        elif bath_ratio >= 0.8:
-            score += 0.05
+    if not (pd.notna(beds) and pd.notna(baths)):
+        return 0.0
 
-    if pd.notna(beds) and pd.notna(baths):
-        if baths >= 4 and beds >= 5:
+    total_rooms = beds + baths
+
+    # Tier 1: Very high room counts — near-certain ADU
+    # A 9bd/6ba or 8bd/5ba home effectively IS two units.
+    if total_rooms >= 14:
+        score += 0.50
+    elif total_rooms >= 11:
+        score += 0.35
+    elif total_rooms >= 9:
+        score += 0.20
+
+    # Excess baths beyond typical single-family pattern.
+    # Rule of thumb: a normal SFH has ~0.5–0.6 baths per bed.
+    # Anything significantly above that suggests a second bathroom set.
+    if beds > 0:
+        expected_baths = 1.0 + (beds - 1) * 0.5  # e.g. 4bd → 2.5ba expected
+        excess_baths = baths - expected_baths
+        if excess_baths >= 2.0:
+            score += 0.20
+        elif excess_baths >= 1.0:
             score += 0.10
 
-    if pd.notna(sqft) and pd.notna(beds) and beds > 0:
-        sqft_per_bed = sqft / beds
-        if sqft_per_bed >= 700:
-            score += 0.10
-        elif sqft_per_bed >= 550:
-            score += 0.05
-
-    if pd.notna(sqft) and sqft >= 3500:
+    # Bath-to-bed ratio >= 1.0 (every bedroom has its own bath = suite-style)
+    if beds > 0 and baths / beds >= 0.9:
         score += 0.10
 
-    return min(score, 0.5)
+    # Large home + many bedrooms (>= 3500sqft with 6+ beds)
+    if pd.notna(sqft):
+        if sqft >= 4000 and beds >= 7:
+            score += 0.15
+        elif sqft >= 3500 and beds >= 6:
+            score += 0.10
+        elif sqft >= 3000 and beds >= 5:
+            score += 0.05
+
+    return min(score, 1.0)
 
 
 def detect_adu_potential(df: pd.DataFrame) -> pd.DataFrame:
@@ -128,7 +171,7 @@ def detect_adu_potential(df: pd.DataFrame) -> pd.DataFrame:
 
     New columns:
       - adu_keyword_score:    0–1 from description keywords
-      - adu_structural_score: 0–0.5 from bed/bath/sqft heuristics
+      - adu_structural_score: 0–1 from bed/bath/sqft heuristics
       - adu_confidence:       combined score (0–1)
       - adu_likely:           True if confidence >= 0.3
     """
@@ -141,8 +184,15 @@ def detect_adu_potential(df: pd.DataFrame) -> pd.DataFrame:
 
     df["adu_structural_score"] = df.apply(_structural_score, axis=1)
 
-    # Combine: keyword signal dominates when available, structural adds on top
-    df["adu_confidence"] = (df["adu_keyword_score"] + df["adu_structural_score"]).clip(0.0, 1.0)
+    # Combine: take the max of the two signals, then add a small bonus when both agree.
+    # This way keywords alone or structure alone can reach high confidence,
+    # and having both is even stronger.
+    kw = df["adu_keyword_score"]
+    st = df["adu_structural_score"]
+    base = pd.concat([kw, st], axis=1).max(axis=1)
+    both_bonus = pd.concat([kw, st], axis=1).min(axis=1) * 0.3
+    df["adu_confidence"] = (base + both_bonus).clip(0.0, 1.0)
+
     df["adu_likely"] = df["adu_confidence"] >= 0.3
 
     n_likely = df["adu_likely"].sum()
@@ -155,11 +205,32 @@ def detect_adu_potential(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ── ADU size estimation ──────────────────────────────────────────────────────
+
+def _estimate_adu_beds(row: pd.Series) -> int:
+    """
+    Estimate how many bedrooms are in the ADU portion of the home.
+
+    Heuristic: a "normal" single-family home in Utah has 3–4 bedrooms.
+    Beds beyond that likely belong to the ADU.  For very large homes (8+),
+    assume roughly half the beds are in the ADU.
+    """
+    beds = row.get("beds")
+    if not pd.notna(beds) or beds < 4:
+        return 1  # minimum: assume at least a studio/1-bed ADU
+
+    # For homes with 4–6 beds, assume ADU has beds - 3 (main home keeps 3)
+    # For homes with 7+ beds, assume roughly half in the ADU
+    main_beds = min(4, math.ceil(beds * 0.5))
+    adu_beds = max(1, int(beds - main_beds))
+    return min(adu_beds, 5)  # cap at 5; beyond that the estimate gets unreliable
+
+
 # ── Rent estimation ──────────────────────────────────────────────────────────
 
-# Utah County ADU rent ranges by ZIP prefix. These are conservative estimates
-# for a 1-bed/1-bath basement apartment based on 2025-2026 local rental data.
-_UT_ADU_RENT_BY_ZIP = {
+# Base rents by ZIP for a **1-bed** ADU in Utah County (2025-2026).
+# Scaled up by bed count in the estimation function.
+_UT_BASE_RENT_1BR = {
     "84003": 1050,   # American Fork
     "84004": 1100,   # Alpine / Highland
     "84005": 1000,   # Eagle Mountain
@@ -178,7 +249,17 @@ _UT_ADU_RENT_BY_ZIP = {
     "84009": 1100,   # South Jordan
     "84095": 1100,   # South Jordan
 }
-_DEFAULT_ADU_RENT = 1000
+_DEFAULT_BASE_RENT_1BR = 1000
+
+# Per-bedroom rent multipliers relative to 1BR base.
+# Source: typical Utah County rental market spread.
+_BED_MULTIPLIER = {
+    1: 1.00,
+    2: 1.35,
+    3: 1.65,
+    4: 1.90,
+    5: 2.10,
+}
 
 
 def estimate_adu_rent(
@@ -189,21 +270,35 @@ def estimate_adu_rent(
     """
     Estimate monthly ADU rental income for listings flagged as likely ADUs.
 
-    Uses ZIP-level lookup, falling back to a config default.
-    Only assigns rent to rows where adu_likely is True.
+    Rent is based on:
+      1. ZIP-level 1BR base rent
+      2. Estimated ADU bedroom count (scaled from total home bed count)
+      3. Bedroom multiplier
+
+    Confidence does NOT scale rent. Once a home is flagged as adu_likely,
+    rent is estimated at face value based on the inferred unit size.
     """
     df = df.copy()
-    rent_map = adu_rent_map or _UT_ADU_RENT_BY_ZIP
-    fallback = default_rent or _DEFAULT_ADU_RENT
+    rent_map = adu_rent_map or _UT_BASE_RENT_1BR
+    fallback = default_rent or _DEFAULT_BASE_RENT_1BR
 
     def _get_rent(row):
         if not row.get("adu_likely", False):
             return 0.0
+
         zip5 = str(row.get("zip_code", ""))[:5]
-        base = rent_map.get(zip5, fallback)
-        return base * row.get("adu_confidence", 0.5)
+        base_1br = rent_map.get(zip5, fallback)
+
+        adu_beds = _estimate_adu_beds(row)
+        multiplier = _BED_MULTIPLIER.get(adu_beds, 2.10)
+
+        return round(base_1br * multiplier)
 
     df["estimated_adu_rent"] = df.apply(_get_rent, axis=1)
+    df["estimated_adu_beds"] = df.apply(
+        lambda r: _estimate_adu_beds(r) if r.get("adu_likely", False) else 0,
+        axis=1,
+    )
     return df
 
 

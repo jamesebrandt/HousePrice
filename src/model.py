@@ -9,10 +9,21 @@ Compares three regressors:
 Training strategy:
   1. Reserve a 15% holdout — never used during model selection.
   2. Select the best architecture via 5-fold cross-validation on the remaining 85%.
+     CV uses multiple metrics (RMSE, MAE, MAPE) for a complete picture.
   3. Refit the winner on all training data, applying exponential recency weights
      (half-life = RECENCY_HALFLIFE_DAYS) when feat_days_since_sale is present.
   4. Evaluate final reported metrics on the reserved holdout and save it to disk
      so model_diagnostics.py shows out-of-sample figures.
+
+Outlier robustness:
+  - The target variable is log-transformed (log-price) during training.
+     This is standard econometric practice for hedonic models: it compresses
+     the price scale so percentage errors are penalised equally at every price
+     level, preventing luxury homes from dominating the loss.
+  - XGBoost uses Pseudo-Huber loss (reg:pseudohuberror) which is linear for
+     large residuals, further limiting the influence of extreme outliers.
+  - Predictions are back-transformed to dollar-space (with bias correction)
+     before being returned to the caller.
 """
 
 import json
@@ -26,9 +37,13 @@ from typing import Optional
 
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import (
+    train_test_split, cross_validate, KFold,
+)
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score, make_scorer,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 
@@ -42,8 +57,6 @@ from src.features import get_model_feature_cols, prepare_dataset
 
 logger = logging.getLogger(__name__)
 
-# Exponential decay half-life for recency weighting.
-# A comp from RECENCY_HALFLIFE_DAYS ago gets weight 0.5; one from today gets 1.0.
 RECENCY_HALFLIFE_DAYS = 180
 
 
@@ -75,6 +88,8 @@ def _build_candidates() -> dict:
                 max_depth=6,
                 subsample=0.8,
                 colsample_bytree=0.8,
+                objective="reg:pseudohuberror",
+                huber_slope=1.0,
                 random_state=42,
                 n_jobs=-1,
                 verbosity=0,
@@ -86,13 +101,36 @@ def _build_candidates() -> dict:
     return candidates
 
 
-def evaluate_model(model, X_test: np.ndarray, y_test: np.ndarray) -> dict:
-    """Compute regression metrics on a held-out test set."""
-    y_pred = model.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    mae  = mean_absolute_error(y_test, y_pred)
-    r2   = r2_score(y_test, y_pred)
-    abs_pct = np.abs((y_test - y_pred) / y_test) * 100
+def _mape_scorer(y_true, y_pred):
+    """Negative MAPE scorer for sklearn CV (higher = better convention)."""
+    abs_pct = np.abs((y_true - y_pred) / y_true) * 100
+    return -abs_pct.mean()
+
+
+def evaluate_model(
+    model, X_test: np.ndarray, y_test: np.ndarray, *, log_target: bool = False,
+) -> dict:
+    """Compute regression metrics on a held-out test set.
+
+    When ``log_target=True``, y_test is in log-space and predictions are
+    back-transformed to dollar-space (with Duan smearing bias correction)
+    before computing metrics so the numbers are directly interpretable.
+    """
+    y_pred_raw = model.predict(X_test)
+
+    if log_target:
+        log_residuals = y_test - y_pred_raw
+        smearing_factor = np.exp(log_residuals).mean()
+        y_pred = np.exp(y_pred_raw) * smearing_factor
+        y_actual = np.exp(y_test)
+    else:
+        y_pred = y_pred_raw
+        y_actual = y_test
+
+    rmse = np.sqrt(mean_squared_error(y_actual, y_pred))
+    mae  = mean_absolute_error(y_actual, y_pred)
+    r2   = r2_score(y_actual, y_pred)
+    abs_pct = np.abs((y_actual - y_pred) / y_actual) * 100
     mape = abs_pct.mean()
     within_10pct = float((abs_pct <= 10).mean() * 100)
     within_20pct = float((abs_pct <= 20).mean() * 100)
@@ -119,21 +157,14 @@ def train(
     Train candidate models via k-fold CV, select the best, refit, evaluate on
     a reserved holdout, and save everything to disk.
 
-    Strategy:
-      1. Reserve ``test_size`` fraction as a final holdout — never used for
-         model selection or fitting.
-      2. Run ``n_cv_folds``-fold CV on the remaining data to compare architectures.
-      3. Refit the winner on all training data, applying exponential recency
-         weights from ``feat_days_since_sale`` when that column is present.
-      4. Report final metrics on the holdout; save holdout data so
-         model_diagnostics.py shows out-of-sample figures.
+    The target variable is log-transformed during training to equalise the
+    influence of homes across the full price range. All reported metrics are
+    back-transformed to dollar-space for interpretability.
 
     Returns:
-        best_model   - fitted sklearn Pipeline
+        best_model   - fitted sklearn Pipeline (predicts log-price)
         feature_cols - list of feature column names used
-        results      - {model_name: metrics}
-                       All candidates include CV_RMSE_mean and CV_RMSE_std.
-                       The winner also includes RMSE, MAE, R2, MAPE_pct (holdout).
+        results      - {model_name: metrics dict}
     """
     if max_price is not None:
         before_cap = len(df)
@@ -150,10 +181,6 @@ def train(
                 "model performance may be unstable."
             )
 
-    # Drop rows with missing or implausible sqft.
-    # Median-imputing missing sqft causes the model to treat sqft as uninformative
-    # (the partial dependence curve goes flat), which is the single biggest driver
-    # of poor model accuracy on individual homes.
     if "sqft" in df.columns:
         before_sqft = len(df)
         df = df[df["sqft"].notna() & (df["sqft"] > 200)].copy()
@@ -169,65 +196,74 @@ def train(
         raise ValueError("No feature columns found. Run prepare_dataset() first.")
 
     X = df[feature_cols].values
-    y = df["price"].values
+    y_dollar = df["price"].values
+    y = np.log(y_dollar)
     cities_all = df["city"].values if "city" in df.columns else np.full(len(df), "unknown")
 
     # ── Temporal recency weights ───────────────────────────────────────────────
-    # Newer comps count more; weight decays exponentially with age.
     sample_weight = None
     if "feat_days_since_sale" in df.columns:
         days = df["feat_days_since_sale"].fillna(730).values.astype(float)
         lam = np.log(2) / RECENCY_HALFLIFE_DAYS
         raw_w = np.exp(-lam * days)
-        sample_weight = raw_w / raw_w.mean()  # normalize so mean weight = 1.0
+        sample_weight = raw_w / raw_w.mean()
         logger.info(
             f"Temporal recency weights applied (half-life={RECENCY_HALFLIFE_DAYS}d): "
             f"weight range [{sample_weight.min():.3f}, {sample_weight.max():.3f}]"
         )
 
     # ── Reserve a final holdout (never used for model selection or fitting) ────
-    # Stratify by price quintile so every price tier is proportionally represented
-    # in both the training and holdout sets. A pure random split on small datasets
-    # can leave the top price range under-represented in the holdout, making
-    # metrics look better than they are for expensive homes.
     indices = np.arange(len(X))
-    price_quintile = pd.qcut(y, q=5, labels=False, duplicates="drop")
+    price_quintile = pd.qcut(y_dollar, q=5, labels=False, duplicates="drop")
     idx_train, idx_holdout = train_test_split(
         indices, test_size=test_size, random_state=random_state,
         stratify=price_quintile,
     )
     X_train, X_holdout = X[idx_train], X[idx_holdout]
     y_train, y_holdout = y[idx_train], y[idx_holdout]
+    y_dollar_holdout = y_dollar[idx_holdout]
     cities_holdout = cities_all[idx_holdout]
     w_train = sample_weight[idx_train] if sample_weight is not None else None
 
     candidates = _build_candidates()
     results: dict = {}
 
-    # ── k-fold CV for model architecture selection ────────────────────────────
+    # ── Multi-metric k-fold CV for model architecture selection ───────────────
+    cv_splitter = KFold(n_splits=n_cv_folds, shuffle=True, random_state=random_state)
+    scoring = {
+        "neg_rmse": "neg_root_mean_squared_error",
+        "neg_mae":  "neg_mean_absolute_error",
+        "neg_mape": make_scorer(_mape_scorer),
+    }
+
     logger.info(
         f"Comparing models via {n_cv_folds}-fold CV "
-        f"({len(X_train):,} training rows)…"
+        f"({len(X_train):,} training rows, log-price target)…"
     )
     for name, pipeline in candidates.items():
-        cv_scores = cross_val_score(
+        cv = cross_validate(
             pipeline, X_train, y_train,
-            cv=n_cv_folds,
-            scoring="neg_root_mean_squared_error",
+            cv=cv_splitter, scoring=scoring,
         )
-        cv_rmse_mean = float(-cv_scores.mean())
-        cv_rmse_std  = float(cv_scores.std())
-        results[name] = {"CV_RMSE_mean": cv_rmse_mean, "CV_RMSE_std": cv_rmse_std}
+        cv_rmse_mean = float(-cv["test_neg_rmse"].mean())
+        cv_rmse_std  = float(cv["test_neg_rmse"].std())
+        cv_mae_mean  = float(-cv["test_neg_mae"].mean())
+        cv_mape_mean = float(-cv["test_neg_mape"].mean())
+        results[name] = {
+            "CV_RMSE_mean": cv_rmse_mean, "CV_RMSE_std": cv_rmse_std,
+            "CV_MAE_mean": cv_mae_mean, "CV_MAPE_mean": cv_mape_mean,
+        }
         logger.info(
-            f"  {name}: CV RMSE = ${cv_rmse_mean:,.0f} ± ${cv_rmse_std:,.0f}"
+            f"  {name}: CV log-RMSE = {cv_rmse_mean:.4f} ± {cv_rmse_std:.4f}  "
+            f"log-MAE = {cv_mae_mean:.4f}  MAPE(log) = {cv_mape_mean:.2f}%"
         )
 
-    # ── Pick best by mean CV RMSE ──────────────────────────────────────────────
+    # ── Pick best by mean CV RMSE on log-price ────────────────────────────────
     best_name = min(results, key=lambda n: results[n]["CV_RMSE_mean"])
     best_model = candidates[best_name]
     logger.info(
         f"\nBest model: {best_name} "
-        f"(CV RMSE=${results[best_name]['CV_RMSE_mean']:,.0f})"
+        f"(CV log-RMSE={results[best_name]['CV_RMSE_mean']:.4f})"
     )
 
     # ── Refit winner on full training set (with recency weights if available) ─
@@ -237,29 +273,46 @@ def train(
     else:
         best_model.fit(X_train, y_train)
 
-    # ── Evaluate on the reserved holdout ─────────────────────────────────────
-    holdout_metrics = evaluate_model(best_model, X_holdout, y_holdout)
+    # ── Evaluate on the reserved holdout (dollar-space metrics) ───────────────
+    holdout_metrics = evaluate_model(
+        best_model, X_holdout, y_holdout, log_target=True,
+    )
     results[best_name].update(holdout_metrics)
     logger.info(
-        f"Holdout test ({len(X_holdout):,} rows): "
+        f"Holdout test ({len(X_holdout):,} rows, back-transformed to $): "
         f"RMSE=${holdout_metrics['RMSE']:,.0f}  MAE=${holdout_metrics['MAE']:,.0f}  "
-        f"R²={holdout_metrics['R2']:.3f}  MAPE={holdout_metrics['MAPE_pct']:.1f}%"
+        f"R²={holdout_metrics['R2']:.3f}  MAPE={holdout_metrics['MAPE_pct']:.1f}%  "
+        f"RMSE/MAE={holdout_metrics['RMSE']/max(holdout_metrics['MAE'],1):.2f}"
     )
 
-    # ── Save model, feature list, and holdout data ────────────────────────────
+    # ── Compute Duan smearing factor for the final model ──────────────────────
+    # Needed at prediction time to correct the retransformation bias.
+    y_pred_train_log = best_model.predict(X_train)
+    log_residuals = y_train - y_pred_train_log
+    smearing_factor = float(np.exp(log_residuals).mean())
+    logger.info(f"Duan smearing factor: {smearing_factor:.4f}")
+
+    # ── Save model, feature list, holdout data, and metadata ──────────────────
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(best_model, model_path)
     joblib.dump(feature_cols, feature_path)
     joblib.dump(
-        {"X_test": X_holdout, "y_test": y_holdout, "cities": cities_holdout},
+        {
+            "X_test": X_holdout,
+            "y_test": y_holdout,
+            "y_test_dollar": y_dollar_holdout,
+            "cities": cities_holdout,
+            "log_target": True,
+            "smearing_factor": smearing_factor,
+        },
         holdout_path,
     )
 
-    # Save a human-readable metrics snapshot alongside the model so the HTML
-    # report can display inline stats without re-running model_diagnostics.py.
     metrics_payload = {
         "model_name": best_name,
         "trained_at": datetime.now().isoformat(timespec="seconds"),
+        "log_target": True,
+        "smearing_factor": smearing_factor,
         "n_training": int(len(X_train)),
         "n_holdout": int(len(X_holdout)),
         "holdout_RMSE": float(holdout_metrics["RMSE"]),
@@ -270,10 +323,7 @@ def train(
         "holdout_within_20pct": holdout_metrics["within_20pct"],
         "holdout_within_30pct": holdout_metrics["within_30pct"],
         "cv_results": {
-            k: {
-                "CV_RMSE_mean": float(v["CV_RMSE_mean"]),
-                "CV_RMSE_std":  float(v["CV_RMSE_std"]),
-            }
+            k: {kk: float(vv) for kk, vv in v.items() if kk.startswith("CV_")}
             for k, v in results.items()
         },
     }
@@ -302,14 +352,36 @@ def load_model(
     return model, feature_cols
 
 
-def predict(model, feature_cols: list[str], df: pd.DataFrame) -> np.ndarray:
+def predict(
+    model,
+    feature_cols: list[str],
+    df: pd.DataFrame,
+    model_path: str = "models/hedonic_model.joblib",
+) -> np.ndarray:
     """
     Run inference on a prepared DataFrame.
     Missing feature columns are filled with 0 (e.g. unseen zip codes).
+
+    Automatically detects log-target models (via the metrics JSON) and
+    back-transforms predictions to dollar-space with Duan smearing.
     """
     for col in feature_cols:
         if col not in df.columns:
             df[col] = 0
 
     X = df[feature_cols].values
-    return model.predict(X)
+    y_pred = model.predict(X)
+
+    metrics_json = model_path.replace(".joblib", "_metrics.json")
+    log_target = False
+    smearing_factor = 1.0
+    if Path(metrics_json).exists():
+        with open(metrics_json) as f:
+            meta = json.load(f)
+        log_target = meta.get("log_target", False)
+        smearing_factor = meta.get("smearing_factor", 1.0)
+
+    if log_target:
+        y_pred = np.exp(y_pred) * smearing_factor
+
+    return y_pred

@@ -161,14 +161,21 @@ def run(
     # If no holdout exists (e.g. model was loaded from a pre-improvement run),
     # fall back to the full prepared dataset with a clear in-sample warning.
     data_label: str
+    log_target = False
+    smearing_factor = 1.0
     if Path(holdout_path).exists():
         print(f"Loading holdout test data from {holdout_path}…")
         holdout = joblib.load(holdout_path)
         X    = holdout["X_test"].astype(float)
-        y    = holdout["y_test"].astype(float)
+        log_target = holdout.get("log_target", False)
+        smearing_factor = holdout.get("smearing_factor", 1.0)
+        if log_target and "y_test_dollar" in holdout:
+            y = holdout["y_test_dollar"].astype(float)
+        else:
+            y = holdout["y_test"].astype(float)
         cities = holdout["cities"]
         data_label = "Out-of-Sample Test Set"
-        print(f"  {len(y):,} holdout rows (out-of-sample)")
+        print(f"  {len(y):,} holdout rows (out-of-sample, log_target={log_target})")
     else:
         print(
             "⚠  No holdout data found — falling back to full prepared dataset.\n"
@@ -202,7 +209,11 @@ def run(
         cities   = df[city_col].values if city_col else np.full(len(df), "unknown")
         data_label = "Full Dataset (IN-SAMPLE — metrics are optimistic)"
 
-    y_pred    = model.predict(X)
+    y_pred_raw = model.predict(X)
+    if log_target:
+        y_pred = np.exp(y_pred_raw) * smearing_factor
+    else:
+        y_pred = y_pred_raw
     residuals = y_pred - y
 
     # Metrics

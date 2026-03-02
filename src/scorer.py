@@ -26,6 +26,35 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def _flag_low_confidence(df: pd.DataFrame) -> pd.DataFrame:
+    """Flag predictions where the model is likely extrapolating.
+
+    A prediction is low-confidence when key physical features fall far
+    outside the training-data distribution seen among active listings.
+    This catches edge cases (e.g., a 10-acre horse property with 1 bed)
+    where the model's prediction shouldn't be trusted blindly.
+    """
+    flags = pd.Series(False, index=df.index)
+    reasons = pd.Series("", index=df.index)
+
+    for col, label in [("sqft", "sqft"), ("price", "price"), ("lot_sqft", "lot size")]:
+        if col not in df.columns:
+            continue
+        vals = df[col].dropna()
+        if vals.empty:
+            continue
+        p5, p95 = vals.quantile(0.05), vals.quantile(0.95)
+        iqr = p95 - p5
+        lo, hi = p5 - 1.5 * iqr, p95 + 1.5 * iqr
+        outlier = df[col].notna() & ((df[col] < lo) | (df[col] > hi))
+        flags |= outlier
+        reasons = reasons.where(~outlier, reasons + f"{label} out-of-range; ")
+
+    df["low_confidence"] = flags
+    df["confidence_reason"] = reasons.str.rstrip("; ")
+    return df
+
+
 def compute_value_scores(df: pd.DataFrame, predicted_prices: np.ndarray) -> pd.DataFrame:
     """
     Attach predicted prices and compute value scores to the listings DataFrame.
@@ -41,9 +70,12 @@ def compute_value_scores(df: pd.DataFrame, predicted_prices: np.ndarray) -> pd.D
           - pct_below_market   (how many % cheaper than predicted)
           - sqft_per_dollar
           - composite_score    (weighted blend of value + features)
+          - low_confidence     (bool — True when model may be extrapolating)
+          - confidence_reason  (human-readable explanation)
     """
     df = df.copy()
     df["predicted_price"] = predicted_prices
+    df = _flag_low_confidence(df)
 
     # Core value score: fraction below predicted
     df["pct_below_market"] = (df["predicted_price"] - df["price"]) / df["predicted_price"] * 100

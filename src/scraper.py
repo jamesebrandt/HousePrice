@@ -28,6 +28,7 @@ import requests
 import pandas as pd
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -300,7 +301,13 @@ def fetch_listings(
 
 # ── Description enrichment via Redfin Stingray API ───────────────────────────
 
-DESCRIPTION_SLEEP = 1.5  # seconds between detail requests
+DESCRIPTION_SLEEP         = 1.2   # seconds between detail requests per worker
+DESCRIPTION_SLEEP_FAILURE = 0.3   # shorter sleep when request fails (not worth being polite)
+DESCRIPTION_WORKERS       = 8     # concurrent fetch threads
+DESCRIPTION_CACHE_FILE    = "data/processed/description_cache.json"
+# If this fraction of the first N probes fail, assume we're blocked and abort early
+EARLY_ABORT_PROBE         = 20
+EARLY_ABORT_THRESHOLD     = 0.90
 
 
 def _stingray_request(endpoint: str, params: dict) -> dict | None:
@@ -368,6 +375,44 @@ def _get_listing_description(property_id: int) -> str | None:
     return None
 
 
+def _load_description_cache() -> dict:
+    """Load the on-disk description cache (URL → description text)."""
+    cache_path = Path(DESCRIPTION_CACHE_FILE)
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_description_cache(cache: dict) -> None:
+    """Persist the description cache to disk."""
+    cache_path = Path(DESCRIPTION_CACHE_FILE)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _fetch_one_description(raw_url: str) -> str | None:
+    """
+    Fetch a single listing description given its full Redfin URL.
+    Returns the description text, or None on failure.
+    Sleeps after the request to rate-limit per worker.
+    """
+    url_path = raw_url
+    if "redfin.com" in url_path:
+        url_path = url_path.split("redfin.com", 1)[1]
+
+    property_id, _ = _get_property_id(url_path)
+    if property_id is None:
+        time.sleep(DESCRIPTION_SLEEP_FAILURE)
+        return None
+
+    desc = _get_listing_description(property_id)
+    time.sleep(DESCRIPTION_SLEEP)
+    return desc
+
+
 def fetch_listing_descriptions(
     df: pd.DataFrame,
     max_listings: int = 200,
@@ -377,7 +422,9 @@ def fetch_listing_descriptions(
     Enrich a DataFrame with listing descriptions by hitting Redfin's detail API.
 
     Only fetches descriptions for rows that have a URL and don't already have one.
-    Adds a 'description' column with the listing remarks text.
+    Uses a persistent on-disk cache to avoid re-fetching across runs, concurrent
+    workers to speed up fetching, and early abort when the API appears to be
+    blocking requests.
 
     Args:
         df:            DataFrame with a URL column pointing to Redfin listing pages.
@@ -395,7 +442,19 @@ def fetch_listing_descriptions(
         logger.info("No URL column found — skipping description enrichment.")
         return df
 
-    # Only fetch for rows without descriptions that have URLs
+    # ── Load cache and fill any already-cached descriptions ──────────────────
+    cache = _load_description_cache()
+    cache_hits = 0
+    for idx, row in df.iterrows():
+        raw_url = str(row.get(url_col, "") or "")
+        if raw_url in cache and pd.isna(df.at[idx, "description"]):
+            df.at[idx, "description"] = cache[raw_url]
+            cache_hits += 1
+
+    if cache_hits:
+        logger.info(f"Description cache: {cache_hits} hit(s) loaded from disk.")
+
+    # ── Identify rows still needing enrichment ────────────────────────────────
     needs_desc = df[
         df["description"].isna() &
         df[url_col].notna() &
@@ -407,39 +466,77 @@ def fetch_listing_descriptions(
         return df
 
     to_fetch = needs_desc.head(max_listings)
+    total = len(to_fetch)
     logger.info(
-        f"Fetching descriptions for {len(to_fetch)} listings "
-        f"(of {len(needs_desc)} needing enrichment, capped at {max_listings})..."
+        f"Fetching descriptions for {total} listings "
+        f"(of {len(needs_desc)} needing enrichment, capped at {max_listings}), "
+        f"{DESCRIPTION_WORKERS} workers..."
     )
 
     fetched = 0
     failed = 0
-    for idx, row in to_fetch.iterrows():
-        raw_url = str(row[url_col])
+    aborted = False
 
-        # Extract the path from a full Redfin URL
-        url_path = raw_url
-        if "redfin.com" in url_path:
-            url_path = url_path.split("redfin.com", 1)[1]
+    # Map idx → url for the work items
+    work_items = [(idx, str(row[url_col])) for idx, row in to_fetch.iterrows()]
 
-        property_id, listing_id = _get_property_id(url_path)
-        if property_id is None:
-            failed += 1
-            time.sleep(DESCRIPTION_SLEEP)
-            continue
+    with ThreadPoolExecutor(max_workers=DESCRIPTION_WORKERS) as executor:
+        futures = {
+            executor.submit(_fetch_one_description, url): (idx, url)
+            for idx, url in work_items
+        }
 
-        desc = _get_listing_description(property_id)
-        if desc:
-            df.at[idx, "description"] = desc
-            fetched += 1
-        else:
-            failed += 1
+        completed = 0
+        for future in as_completed(futures):
+            idx, raw_url = futures[future]
+            completed += 1
 
-        time.sleep(DESCRIPTION_SLEEP)
+            try:
+                desc = future.result()
+            except Exception as e:
+                logger.debug(f"Description future raised: {e}")
+                desc = None
 
+            if desc:
+                df.at[idx, "description"] = desc
+                cache[raw_url] = desc
+                fetched += 1
+            else:
+                failed += 1
+
+            # Progress log every 25 completions
+            if completed == 1 or completed % 25 == 0 or completed == total:
+                logger.info(
+                    f"  Descriptions: {completed}/{total} "
+                    f"({fetched} ok, {failed} failed)..."
+                )
+
+            # Early-abort: if first EARLY_ABORT_PROBE results are overwhelmingly
+            # failing, Redfin is almost certainly blocking us — stop wasting time.
+            if completed == EARLY_ABORT_PROBE and fetched == 0:
+                fail_rate = failed / completed
+                if fail_rate >= EARLY_ABORT_THRESHOLD:
+                    logger.warning(
+                        f"  Early abort: {fail_rate:.0%} failure rate after "
+                        f"{EARLY_ABORT_PROBE} probes — Redfin appears to be blocking "
+                        "description requests. Cancelling remaining fetches."
+                    )
+                    for f in futures:
+                        f.cancel()
+                    aborted = True
+                    break
+
+    # Persist any newly fetched descriptions to disk
+    if fetched:
+        _save_description_cache(cache)
+        logger.info(f"  Saved {fetched} new description(s) to cache.")
+
+    skipped_cap = len(needs_desc) - len(to_fetch)
+    skipped_abort = (total - completed) if aborted else 0
     logger.info(
         f"Description enrichment complete: {fetched} fetched, {failed} failed, "
-        f"{len(needs_desc) - len(to_fetch)} skipped (over cap)."
+        f"{skipped_cap} skipped (over cap)"
+        + (f", {skipped_abort} cancelled (early abort)" if aborted else "") + "."
     )
     return df
 

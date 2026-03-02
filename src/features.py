@@ -13,6 +13,14 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# Redfin sometimes prepends a 6-char hash to city names (e.g. "8hno7i Lake Pt").
+_GARBLED_CITY_RE = re.compile(r"^[A-Za-z0-9]{6}\s+(.+)$")
+
+# Common abbreviations in Redfin data → canonical names.
+_CITY_ALIAS = {
+    "Lake Pt": "Lake Point",
+}
+
 # Map raw Redfin column names → clean names.
 # Covers both the current format (starts with SALE TYPE) and the older MLS#-first format.
 COLUMN_MAP = {
@@ -74,6 +82,17 @@ def _parse_sqft(val) -> float:
         return np.nan
 
 
+def _sanitize_city(name: str) -> str:
+    """Strip garbled Redfin hash prefixes and normalise abbreviations."""
+    if pd.isna(name):
+        return name
+    s = str(name).strip()
+    m = _GARBLED_CITY_RE.match(s)
+    if m:
+        s = m.group(1).strip()
+    return _CITY_ALIAS.get(s, s)
+
+
 def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Rename Redfin columns to clean names. Tolerates missing columns."""
     rename = {k: v for k, v in COLUMN_MAP.items() if k in df.columns}
@@ -86,6 +105,17 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df["city"] = df["city"].fillna(df["city_raw"])
         df = df.drop(columns=["city_raw"])
+
+    # Sanitize city names: strip hash prefixes, normalise abbreviations
+    if "city" in df.columns:
+        before = df["city"].nunique()
+        df["city"] = df["city"].apply(_sanitize_city)
+        after = df["city"].nunique()
+        if before != after:
+            logger.info(
+                f"City name sanitization: {before} → {after} unique cities "
+                f"(merged {before - after} garbled/abbreviated variants)"
+            )
 
     # Also handle any columns already renamed
     for col in df.columns:
