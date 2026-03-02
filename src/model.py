@@ -20,7 +20,7 @@ Outlier robustness:
      This is standard econometric practice for hedonic models: it compresses
      the price scale so percentage errors are penalised equally at every price
      level, preventing luxury homes from dominating the loss.
-  - XGBoost uses Pseudo-Huber loss (reg:pseudohuberror) which is linear for
+  - XGBoost uses Pseudo-Huber loss (reg:pseudohubererror) which is linear for
      large residuals, further limiting the influence of extreme outliers.
   - Predictions are back-transformed to dollar-space (with bias correction)
      before being returned to the caller.
@@ -88,7 +88,7 @@ def _build_candidates() -> dict:
                 max_depth=6,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                objective="reg:pseudohuberror",
+                objective="reg:pseudohubererror",
                 huber_slope=1.0,
                 random_state=42,
                 n_jobs=-1,
