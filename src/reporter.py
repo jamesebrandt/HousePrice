@@ -69,11 +69,25 @@ def _model_info_html(m: dict) -> str:
     n_ho  = m.get("n_holdout")
     n_str = f"{n_tr:,} training + {n_ho:,} holdout" if n_tr and n_ho else "—"
     cv = m.get("cv_results", {})
-    cv_lines = "  ·  ".join(
-        f"{k}: ${v['CV_RMSE_mean']/1e3:.0f}K ± ${v['CV_RMSE_std']/1e3:.0f}K"
-        for k, v in cv.items()
-        if "CV_RMSE_mean" in v
-    )
+    median_price = m.get("median_training_price", 0)
+
+    cv_parts = []
+    for k, v in cv.items():
+        if "CV_RMSE_dollar" in v:
+            rmse_d = v["CV_RMSE_dollar"]
+            std_d  = v["CV_RMSE_std_dollar"]
+            cv_parts.append(f"{k}: ${rmse_d/1e3:.0f}K ± ${std_d/1e3:.0f}K")
+        elif "CV_RMSE_mean" in v and median_price > 0:
+            import math
+            rmse_d = (math.exp(v["CV_RMSE_mean"]) - 1) * median_price
+            std_d  = (math.exp(v["CV_RMSE_std"]) - 1) * median_price
+            cv_parts.append(f"{k}: ${rmse_d/1e3:.0f}K ± ${std_d/1e3:.0f}K")
+        elif "CV_RMSE_mean" in v:
+            cv_parts.append(
+                f"{k}: log-RMSE {v['CV_RMSE_mean']:.3f} ± {v['CV_RMSE_std']:.3f}"
+            )
+    cv_lines = "  ·  ".join(cv_parts)
+
     return (
         f'<div class="diag-model-info">'
         f'<strong>Algorithm:</strong> {name}&emsp;'

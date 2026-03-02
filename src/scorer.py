@@ -74,6 +74,27 @@ def compute_value_scores(df: pd.DataFrame, predicted_prices: np.ndarray) -> pd.D
           - confidence_reason  (human-readable explanation)
     """
     df = df.copy()
+
+    # Market-normalize predictions so that the median listing sits at "fairly
+    # priced" (value_score ≈ 0).  The model is trained on historical comps
+    # whose asking prices may reflect a different market level than today's
+    # active listings.  Without this step the model may systematically
+    # label most listings as "undervalued" or "overpriced".
+    #
+    # Method: compute the per-listing ratio actual/predicted, then scale all
+    # predictions by the median ratio.  This centres value scores around
+    # zero while preserving the relative ordering (which homes are cheaper
+    # *for what they are* compared to peers).
+    ratios = df["price"].values / predicted_prices
+    finite_ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
+    if len(finite_ratios) >= 10:
+        market_scale = float(np.median(finite_ratios))
+        predicted_prices = predicted_prices * market_scale
+        logger.info(
+            f"Market-normalisation: scaled predictions by {market_scale:.4f} "
+            f"(median ratio actual/predicted)"
+        )
+
     df["predicted_price"] = predicted_prices
     df = _flag_low_confidence(df)
 

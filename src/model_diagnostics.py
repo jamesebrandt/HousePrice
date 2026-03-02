@@ -209,11 +209,34 @@ def run(
         cities   = df[city_col].values if city_col else np.full(len(df), "unknown")
         data_label = "Full Dataset (IN-SAMPLE — metrics are optimistic)"
 
+    # Load calibration factors from metrics JSON if available
+    metrics_json = Path(model_path.replace(".joblib", "_metrics.json"))
+    global_cal = 1.0
+    city_cal: dict[str, float] = {}
+    if metrics_json.exists():
+        import json as _json
+        with open(metrics_json) as _f:
+            _meta = _json.load(_f)
+        global_cal = _meta.get("calibration_factor", 1.0)
+        city_cal = _meta.get("city_calibration", {})
+        if abs(global_cal - 1.0) > 0.005 or city_cal:
+            print(f"  Calibration factor (global): {global_cal:.4f}")
+
     y_pred_raw = model.predict(X)
     if log_target:
         y_pred = np.exp(y_pred_raw) * smearing_factor
     else:
         y_pred = y_pred_raw
+
+    # Apply city-level calibration where available, global otherwise
+    if city_cal:
+        cal_factors = np.array([
+            city_cal.get(str(c), global_cal) for c in cities
+        ])
+        y_pred = y_pred * cal_factors
+    elif abs(global_cal - 1.0) > 0.005:
+        y_pred = y_pred * global_cal
+
     residuals = y_pred - y
 
     # Metrics

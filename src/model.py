@@ -88,8 +88,7 @@ def _build_candidates() -> dict:
                 max_depth=6,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                objective="reg:pseudohubererror",
-                huber_slope=1.0,
+                objective="reg:squarederror",
                 random_state=42,
                 n_jobs=-1,
                 verbosity=0,
@@ -236,6 +235,8 @@ def train(
         "neg_mape": make_scorer(_mape_scorer),
     }
 
+    median_train_price = float(np.median(y_dollar[idx_train]))
+
     logger.info(
         f"Comparing models via {n_cv_folds}-fold CV "
         f"({len(X_train):,} training rows, log-price target)…"
@@ -249,12 +250,21 @@ def train(
         cv_rmse_std  = float(cv["test_neg_rmse"].std())
         cv_mae_mean  = float(-cv["test_neg_mae"].mean())
         cv_mape_mean = float(-cv["test_neg_mape"].mean())
+
+        # Approximate dollar-space RMSE: a log-RMSE of σ corresponds to
+        # roughly (exp(σ) - 1) * median_price in dollar terms.
+        cv_rmse_dollar = float((np.exp(cv_rmse_mean) - 1) * median_train_price)
+        cv_rmse_std_dollar = float((np.exp(cv_rmse_std) - 1) * median_train_price)
+
         results[name] = {
             "CV_RMSE_mean": cv_rmse_mean, "CV_RMSE_std": cv_rmse_std,
             "CV_MAE_mean": cv_mae_mean, "CV_MAPE_mean": cv_mape_mean,
+            "CV_RMSE_dollar": cv_rmse_dollar,
+            "CV_RMSE_std_dollar": cv_rmse_std_dollar,
         }
         logger.info(
             f"  {name}: CV log-RMSE = {cv_rmse_mean:.4f} ± {cv_rmse_std:.4f}  "
+            f"(≈${cv_rmse_dollar/1e3:.0f}K ± ${cv_rmse_std_dollar/1e3:.0f}K)  "
             f"log-MAE = {cv_mae_mean:.4f}  MAPE(log) = {cv_mape_mean:.2f}%"
         )
 
@@ -286,11 +296,41 @@ def train(
     )
 
     # ── Compute Duan smearing factor for the final model ──────────────────────
-    # Needed at prediction time to correct the retransformation bias.
     y_pred_train_log = best_model.predict(X_train)
     log_residuals = y_train - y_pred_train_log
     smearing_factor = float(np.exp(log_residuals).mean())
     logger.info(f"Duan smearing factor: {smearing_factor:.4f}")
+
+    # ── Calibration: measure and correct systematic prediction bias ───────────
+    # The model may systematically over- or under-predict due to market drift,
+    # temporal weighting imperfections, or training-data composition.  We compute
+    # a multiplicative calibration factor from the holdout set so that the median
+    # predicted price equals the median actual price.
+    #
+    # Global factor: median(actual / predicted) across all holdout rows.
+    # City factors: same ratio per city — corrects location-level bias
+    # (e.g. Springville over-prediction) that the city dummies didn't capture.
+    y_pred_holdout_log = best_model.predict(X_holdout)
+    y_pred_holdout_dollar = np.exp(y_pred_holdout_log) * smearing_factor
+    ratios = y_dollar_holdout / y_pred_holdout_dollar
+    global_cal = float(np.median(ratios))
+
+    city_calibration: dict[str, float] = {}
+    for city_name in set(cities_holdout):
+        mask = cities_holdout == city_name
+        if mask.sum() >= 5:
+            city_cal = float(np.median(ratios[mask]))
+            city_calibration[str(city_name)] = city_cal
+
+    logger.info(
+        f"Calibration factor (global): {global_cal:.4f} "
+        f"(1.0 = no bias, <1 = model over-predicts)"
+    )
+    if city_calibration:
+        biased = {c: f"{v:.3f}" for c, v in city_calibration.items()
+                  if abs(v - 1.0) > 0.03}
+        if biased:
+            logger.info(f"City-level calibration offsets (>3% bias): {biased}")
 
     # ── Save model, feature list, holdout data, and metadata ──────────────────
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
@@ -313,6 +353,9 @@ def train(
         "trained_at": datetime.now().isoformat(timespec="seconds"),
         "log_target": True,
         "smearing_factor": smearing_factor,
+        "calibration_factor": global_cal,
+        "city_calibration": city_calibration,
+        "median_training_price": median_train_price,
         "n_training": int(len(X_train)),
         "n_holdout": int(len(X_holdout)),
         "holdout_RMSE": float(holdout_metrics["RMSE"]),
@@ -364,6 +407,9 @@ def predict(
 
     Automatically detects log-target models (via the metrics JSON) and
     back-transforms predictions to dollar-space with Duan smearing.
+
+    Applies calibration factors (global + per-city) computed during training
+    to correct systematic prediction bias.
     """
     for col in feature_cols:
         if col not in df.columns:
@@ -375,13 +421,27 @@ def predict(
     metrics_json = model_path.replace(".joblib", "_metrics.json")
     log_target = False
     smearing_factor = 1.0
+    global_cal = 1.0
+    city_cal: dict[str, float] = {}
     if Path(metrics_json).exists():
         with open(metrics_json) as f:
             meta = json.load(f)
         log_target = meta.get("log_target", False)
         smearing_factor = meta.get("smearing_factor", 1.0)
+        global_cal = meta.get("calibration_factor", 1.0)
+        city_cal = meta.get("city_calibration", {})
 
     if log_target:
         y_pred = np.exp(y_pred) * smearing_factor
+
+    # Apply city-level calibration where available, global otherwise
+    if city_cal and "city" in df.columns:
+        cities = df["city"].astype(str).values
+        cal_factors = np.array([
+            city_cal.get(c, global_cal) for c in cities
+        ])
+        y_pred = y_pred * cal_factors
+    elif abs(global_cal - 1.0) > 0.005:
+        y_pred = y_pred * global_cal
 
     return y_pred
