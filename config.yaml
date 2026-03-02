@@ -19,6 +19,12 @@ search:
   exclude_cities:
     - "Fountain Green"
     - "Benjamin"
+    # Weber County cities are north of SLC — outside the SLC-to-Nephi search corridor.
+    # Their price dynamics differ enough to add noise rather than signal.
+    - "West Haven"
+    - "Ogden"
+    - "Syracuse"
+    - "Clearfield"
   # All downloaded cities — used only to train the model (more sold data = better predictions)
   training_cities:
     - "Saratoga Springs"
@@ -37,14 +43,10 @@ search:
     - "Stansbury Park"
     - "Grantsville"
     - "Burmester"
-    - "West Haven"
-    - "Ogden"
-    - "Syracuse"
-    - "Clearfield"
     - "Nephi"
 
 criteria:
-  max_price: 500000
+  max_price: 800000
   min_beds: 3
   min_baths: 2.0
   min_sqft: 1800
@@ -57,9 +59,31 @@ scoring:
   min_value_score: 0.05         # flag homes priced 5%+ below predicted value
   top_n_alerts: 5               # include top N homes in each email alert
 
+adu:
+  enabled: true
+  # Mortgage assumptions for net monthly cost calculation.
+  # Set mortgage_rate_pct to null to auto-load the latest rate from FRED Data.
+  mortgage_rate_pct: null        # null = auto-detect from data/raw/FRED Data/MORTGAGE30US.csv
+  down_payment_pct: 5            # percent down (5 = 5%)
+  mortgage_term_years: 30
+  # Default monthly ADU rent when ZIP-level data isn't available.
+  default_adu_rent: 1000
+  # Max listings to fetch descriptions for (Redfin detail API, ~1.5s each).
+  max_description_fetches: 200
+  # Minimum ADU confidence to flag a listing (0.0–1.0).
+  min_adu_confidence: 0.3
+
 notifications:
   email_to: "your@email.com"    # EDIT THIS
   email_from: "alerts@gmail.com" # EDIT THIS — use an App Password, not your real password
+
+# How stale each data source can be before an alert email is sent.
+# Set a value to null to disable alerts for that source.
+data_freshness:
+  redfin_days: 1      # Redfin listing CSVs — refreshed daily via scheduled --refetch
+  bps_days: 45        # Census BPS permit files — monthly release with ~1-month lag
+  zhvi_days: 45       # Zillow ZHVI city CSV — monthly release with ~1-month lag
+  acs_days: 400       # Census ACS income — annual release (~13 months between updates)
 
 paths:
   raw_data_dir: "data/raw"

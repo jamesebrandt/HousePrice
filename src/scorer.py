@@ -13,7 +13,10 @@ Value Score = (predicted_price - actual_price) / predicted_price
 Additional composite score factors in features-per-dollar:
   - Sqft per dollar
   - Beds + baths relative to price
-This gives a more holistic "bang for your buck" signal.
+
+When ADU data is available, an affordability bonus is blended in:
+  - Homes with likely ADU income get a boost proportional to the
+    fraction of the mortgage that ADU rent offsets.
 """
 
 import logging
@@ -60,13 +63,33 @@ def compute_value_scores(df: pd.DataFrame, predicted_prices: np.ndarray) -> pd.D
     else:
         df["rooms_per_100k_norm"] = 0.0
 
-    # Composite score: 60% price vs market, 25% sqft/dollar, 15% rooms/dollar
+    # ADU affordability bonus: fraction of mortgage offset by ADU rent
+    has_adu_data = "estimated_adu_rent" in df.columns and "estimated_mortgage" in df.columns
+    if has_adu_data:
+        safe_mortgage = df["estimated_mortgage"].replace(0, np.nan)
+        df["adu_offset_pct"] = (df["estimated_adu_rent"] / safe_mortgage).fillna(0).clip(0, 1)
+        df["adu_offset_norm"] = _normalize(df["adu_offset_pct"])
+    else:
+        df["adu_offset_pct"] = 0.0
+        df["adu_offset_norm"] = 0.0
+
+    # Composite score: value + sqft/dollar + rooms/dollar + ADU bonus
+    # With ADU data: 50% value, 20% sqft, 12% rooms, 18% ADU affordability
+    # Without:       60% value, 25% sqft, 15% rooms (original weights)
     value_norm = _normalize(df["value_score"].clip(-0.5, 0.5))
-    df["composite_score"] = (
-        0.60 * value_norm +
-        0.25 * df["sqft_per_dollar_norm"] +
-        0.15 * df["rooms_per_100k_norm"]
-    )
+    if has_adu_data and (df["adu_offset_pct"] > 0).any():
+        df["composite_score"] = (
+            0.50 * value_norm +
+            0.20 * df["sqft_per_dollar_norm"] +
+            0.12 * df["rooms_per_100k_norm"] +
+            0.18 * df["adu_offset_norm"]
+        )
+    else:
+        df["composite_score"] = (
+            0.60 * value_norm +
+            0.25 * df["sqft_per_dollar_norm"] +
+            0.15 * df["rooms_per_100k_norm"]
+        )
 
     return df.sort_values("composite_score", ascending=False).reset_index(drop=True)
 

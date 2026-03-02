@@ -28,6 +28,7 @@ import sys
 import logging
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -158,6 +159,7 @@ def run(
     raw_dir: str  = "data/raw",
     model_path:   str = "models/hedonic_model.joblib",
     feature_path: str = "models/hedonic_model_features.joblib",
+    holdout_path: str = "models/hedonic_model_holdout.joblib",
     config_path:  str = "config.yaml",
 ):
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -170,36 +172,55 @@ def run(
             cfg = yaml.safe_load(f) or {}
         exclude_cities = cfg.get("search", {}).get("exclude_cities")
 
-    # ── Load data ──────────────────────────────────────────────────────────────
-    print("Loading prepared data…")
-    prepared_path = Path("data/processed/prepared_listings.csv")
-    if prepared_path.exists():
-        df = pd.read_csv(prepared_path)
-        print(f"  {len(df):,} rows from prepared_listings.csv")
-    else:
-        print("  Re-processing from raw CSVs…")
-        raw = load_all_raw_csv(raw_dir)
-        permit_features = compute_permit_features(
-            load_bps_data(f"{raw_dir}/BPS Data"),
-            bps_dir=f"{raw_dir}/BPS Data",
-        )
-        zhvi_features = compute_zhvi_features(
-            load_zhvi_data(f"{raw_dir}/Zillow Data", state="UT")
-        )
-        income_map = load_acs_income(f"{raw_dir}/Census Data")
-        df = prepare_dataset(raw, permit_features=permit_features,
-                             zhvi_features=zhvi_features, income_map=income_map,
-                             exclude_cities=exclude_cities)
-
     print("Loading model…")
     model, feature_cols = load_model(model_path, feature_path)
-    for col in feature_cols:
-        if col not in df.columns:
-            df[col] = 0
 
-    X = df[feature_cols].astype(float).values
-    y = df["price"].values
-    y_pred = model.predict(X)
+    # ── Prefer the saved holdout for honest out-of-sample metrics ─────────────
+    # If no holdout exists (e.g. model was loaded from a pre-improvement run),
+    # fall back to the full prepared dataset with a clear in-sample warning.
+    data_label: str
+    if Path(holdout_path).exists():
+        print(f"Loading holdout test data from {holdout_path}…")
+        holdout = joblib.load(holdout_path)
+        X    = holdout["X_test"].astype(float)
+        y    = holdout["y_test"].astype(float)
+        cities = holdout["cities"]
+        data_label = "Out-of-Sample Test Set"
+        print(f"  {len(y):,} holdout rows (out-of-sample)")
+    else:
+        print(
+            "⚠  No holdout data found — falling back to full prepared dataset.\n"
+            "   Metrics are IN-SAMPLE and will be optimistic.\n"
+            "   Re-run with --retrain to generate a proper test set."
+        )
+        prepared_path = Path("data/processed/prepared_listings.csv")
+        if prepared_path.exists():
+            df = pd.read_csv(prepared_path)
+            print(f"  {len(df):,} rows from prepared_listings.csv")
+        else:
+            print("  Re-processing from raw CSVs…")
+            raw = load_all_raw_csv(raw_dir)
+            permit_features = compute_permit_features(
+                load_bps_data(f"{raw_dir}/BPS Data"),
+                bps_dir=f"{raw_dir}/BPS Data",
+            )
+            zhvi_features = compute_zhvi_features(
+                load_zhvi_data(f"{raw_dir}/Zillow Data", state="UT")
+            )
+            income_map = load_acs_income(f"{raw_dir}/Census Data")
+            df = prepare_dataset(raw, permit_features=permit_features,
+                                 zhvi_features=zhvi_features, income_map=income_map,
+                                 exclude_cities=exclude_cities)
+        for col in feature_cols:
+            if col not in df.columns:
+                df[col] = 0
+        X = df[feature_cols].astype(float).values
+        y = df["price"].values
+        city_col = "city" if "city" in df.columns else None
+        cities   = df[city_col].values if city_col else np.full(len(df), "unknown")
+        data_label = "Full Dataset (IN-SAMPLE — metrics are optimistic)"
+
+    y_pred    = model.predict(X)
     residuals = y_pred - y
 
     # Metrics
@@ -215,11 +236,8 @@ def run(
 
     sw_stat, sw_p = stats.shapiro(residuals[:min(len(residuals), 5000)])
 
-    print(f"R²={r2:.3f}  RMSE=${rmse:,.0f}  MAPE={mape:.1f}%")
+    print(f"R²={r2:.3f}  RMSE=${rmse:,.0f}  MAPE={mape:.1f}%  [{data_label}]")
     print(f"Within ±10%: {within10:.0f}%  ±20%: {within20:.0f}%  ±30%: {within30:.0f}%")
-
-    city_col = "city" if "city" in df.columns else None
-    cities   = df[city_col].values if city_col else np.full(len(df), "unknown")
     unique_cities = sorted(set(cities))
     city_color_map = {c: CITY_COLORS[i % len(CITY_COLORS)]
                       for i, c in enumerate(unique_cities)}
@@ -227,8 +245,8 @@ def run(
     # ── Figure layout ──────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(20, 22), facecolor="white")
     fig.suptitle(
-        f"Home Price Model — Diagnostic Report\n"
-        f"RandomForest / XGBoost  ·  {len(df):,} listings  ·  "
+        f"Home Price Model — Diagnostic Report  [{data_label}]\n"
+        f"Ridge / RandomForest / XGBoost  ·  {len(y):,} listings  ·  "
         f"R² = {r2:.3f}  ·  RMSE = ${rmse/1e3:.0f}K  ·  MAPE = {mape:.1f}%",
         fontsize=15, fontweight="bold", color=P["dark"], y=0.995,
     )
@@ -514,8 +532,8 @@ def run(
     # ── Footer ────────────────────────────────────────────────────────────────
     fig.text(
         0.5, 0.005,
-        f"{len(df):,} listings  ·  "
-        f"R² = {r2:.3f} (in-sample)  ·  RMSE = ${rmse/1e3:.0f}K  ·  "
+        f"{len(y):,} listings  ·  [{data_label}]  ·  "
+        f"R² = {r2:.3f}  ·  RMSE = ${rmse/1e3:.0f}K  ·  "
         f"MAE = ${mae/1e3:.0f}K  ·  MAPE = {mape:.1f}%  ·  "
         f"Within ±10%: {within10:.0f}%  ±20%: {within20:.0f}%  ±30%: {within30:.0f}%",
         ha="center", fontsize=9.5, color=P["gray"],

@@ -43,6 +43,7 @@ COLUMN_MAP = {
     "LONGITUDE":        "longitude",
     "city":             "city",
     "sold":             "sold",
+    "description":      "description",
 }
 
 NUMERIC_COLS = ["price", "beds", "baths", "sqft", "lot_sqft", "year_built",
@@ -135,6 +136,14 @@ def engineer_features(
     if "year_built" in df.columns:
         df["feat_home_age"] = current_year - df["year_built"]
 
+    # ── Days since sale (recency — used for temporal weighting in training) ────
+    if "sold_date" in df.columns:
+        today = pd.Timestamp.today().normalize()
+        sold_dt = pd.to_datetime(df["sold_date"], errors="coerce")
+        df["feat_days_since_sale"] = (today - sold_dt).dt.days.clip(lower=0)
+        # Active/unsold listings have no sold_date — fill with 0 (not used in training)
+        df["feat_days_since_sale"] = df["feat_days_since_sale"].fillna(0).astype(int)
+
     if "sqft" in df.columns and "beds" in df.columns:
         df["feat_sqft_per_bed"] = df["sqft"] / df["beds"].replace(0, np.nan)
 
@@ -205,6 +214,8 @@ def get_model_feature_cols(df: pd.DataFrame) -> list[str]:
             "feat_sqft_per_bed", "feat_lot_to_sqft_ratio",
             "feat_has_hoa", "hoa_monthly", "days_on_market", "feat_long_on_market",
             "latitude", "longitude",
+            # Recency signal: lets the model capture market drift over the 2-year comp window
+            "feat_days_since_sale",
             # ZIP-level Census median household income
             "feat_median_income",
             # County-level building permit features (demand signal — recent + long-term)
@@ -212,7 +223,9 @@ def get_model_feature_cols(df: pd.DataFrame) -> list[str]:
             "feat_permits_10yr_cagr", "feat_permits_long_trend",
             # City-level Zillow ZHVI appreciation features
             "feat_zhvi_current", "feat_zhvi_yoy_pct", "feat_zhvi_3yr_cagr",
-            "feat_zhvi_5yr_cagr", "feat_zhvi_momentum"]
+            "feat_zhvi_5yr_cagr", "feat_zhvi_momentum",
+            # ADU potential (structural heuristic — keyword score isn't available for sold comps)
+            "adu_structural_score"]
     city_cols = [c for c in df.columns if c.startswith("city_")]
     # Match zip dummy columns like zip_84003 — exclude the raw "zip_code" string column
     zip_cols  = [c for c in df.columns if c.startswith("zip_") and c != "zip_code"]

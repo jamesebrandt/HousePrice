@@ -4,9 +4,8 @@ Redfin listing scraper — multi-page, multi-source, deduplicating.
 Strategies used to maximize data volume:
   1. Pagination — loops through up to MAX_PAGES per query
   2. sold_within_days=730 — 2 years of sold comps for model training
-  3. Zip code searches — supplement city searches with direct zip queries
-  4. Multiple property types — single-family + townhomes (uipt 1,2)
-  5. Deduplication — drops duplicate MLS# rows across all sources
+  3. Multiple property types — single-family + townhomes (uipt 1,2)
+  4. Deduplication — drops duplicate MLS# rows across all sources
 
 Manual CSV download (fastest first run):
   1. Go to https://www.redfin.com/city/18736/UT/Saratoga-Springs
@@ -15,9 +14,14 @@ Manual CSV download (fastest first run):
   4. Save to data/raw/saratoga_springs_sold.csv
   5. Repeat for Eagle Mountain, Lehi, American Fork, etc.
   6. Call load_all_raw_csv() to merge everything.
+
+NOTE: The gis-csv API endpoint (used by fetch_listings) frequently returns
+listings without sale prices due to MLS restrictions. For model training,
+manually downloaded CSVs are strongly preferred over the live API.
 """
 
 import io
+import json
 import time
 import logging
 import requests
@@ -29,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 REDFIN_BASE = "https://www.redfin.com"
 SEARCH_URL  = f"{REDFIN_BASE}/stingray/api/gis-csv"
+STINGRAY_BASE = f"{REDFIN_BASE}/stingray/"
 
 HEADERS = {
     "User-Agent": (
@@ -42,7 +47,11 @@ HEADERS = {
 }
 
 # City → Redfin region ID (region_type 6 = city)
+# IDs sourced from redfin.com/city/<id>/UT/<CityName> URLs.
+# Cities too small for a Redfin city page (Elk Ridge, Lake Point, Stansbury Park,
+# Daniel, Payson UT, Nephi) are covered only by manual CSV download.
 CITY_REGIONS = {
+    # Utah County — north
     "Saratoga Springs": {"region_id": "18736", "region_type": "6"},
     "Eagle Mountain":   {"region_id": "17872", "region_type": "6"},
     "Lehi":             {"region_id": "18248", "region_type": "6"},
@@ -52,19 +61,15 @@ CITY_REGIONS = {
     "Bluffdale":        {"region_id": "17014", "region_type": "6"},
     "Herriman":         {"region_id": "17963", "region_type": "6"},
     "Riverton":         {"region_id": "18601", "region_type": "6"},
-}
-
-# Zip code → city label  (region_type 2 = zip)
-# These supplement city searches and often return different result sets
-ZIP_REGIONS = {
-    "84045": {"region_id": "84045", "region_type": "2", "city": "Saratoga Springs"},
-    "84005": {"region_id": "84005", "region_type": "2", "city": "Eagle Mountain"},
-    "84043": {"region_id": "84043", "region_type": "2", "city": "Lehi"},
-    "84003": {"region_id": "84003", "region_type": "2", "city": "American Fork"},
-    "84062": {"region_id": "84062", "region_type": "2", "city": "Cedar Hills"},
-    "84013": {"region_id": "84013", "region_type": "2", "city": "Eagle Mountain"},  # Cedar Valley/EM overflow
-    "84065": {"region_id": "84065", "region_type": "2", "city": "Riverton"},
-    "84096": {"region_id": "84096", "region_type": "2", "city": "Herriman"},
+    # Utah County — south (Spanish Fork corridor)
+    "Spanish Fork":     {"region_id": "18207", "region_type": "6"},
+    "Mapleton":         {"region_id": "12244", "region_type": "6"},
+    "Santaquin":        {"region_id": "17357", "region_type": "6"},
+    # Wasatch County
+    "Heber City":       {"region_id": "8736",  "region_type": "6"},  # Redfin page: "Heber"
+    # Tooele County
+    "Tooele":           {"region_id": "19397", "region_type": "6"},
+    "Grantsville":      {"region_id": "7960",  "region_type": "6"},
 }
 
 # How far back to look for sold listings
@@ -230,19 +235,22 @@ def fetch_listings(
     cities: list[str],
     include_sold: bool = True,
     save_dir: str = "data/raw",
-    also_search_zips: bool = True,
 ) -> pd.DataFrame:
     """
-    Fetch active + sold listings for target cities (and optionally their zip codes).
+    Fetch active + sold listings for target cities via the Redfin gis-csv API.
 
     Args:
-        cities:          City names matching keys in CITY_REGIONS.
-        include_sold:    Whether to also fetch recently-sold comps (needed for training).
-        save_dir:        Directory to write per-source CSV files.
-        also_search_zips: Also run zip-code-level searches to supplement city results.
+        cities:       City names matching keys in CITY_REGIONS.
+        include_sold: Whether to also fetch recently-sold comps (needed for training).
+        save_dir:     Directory to write per-source CSV files.
 
     Returns:
         Combined, deduplicated DataFrame of all listings.
+
+    Note:
+        Sold listings returned by the API frequently have a blank PRICE column due
+        to MLS data restrictions. For training data, manually downloaded CSVs from
+        redfin.com are more reliable — see the module docstring for instructions.
     """
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     frames = []
@@ -273,8 +281,6 @@ def fetch_listings(
                 frames.append(df_sold)
                 logger.info(f"  {city} sold total: {len(df_sold)}")
 
-    # (Zip-code region_type=2 is not supported by gis-csv — skipping)
-
     if not frames:
         logger.error(
             "No data fetched from any source.\n"
@@ -290,6 +296,152 @@ def fetch_listings(
 
     combined.to_csv(f"{save_dir}/all_listings_raw.csv", index=False)
     return combined
+
+
+# ── Description enrichment via Redfin Stingray API ───────────────────────────
+
+DESCRIPTION_SLEEP = 1.5  # seconds between detail requests
+
+
+def _stingray_request(endpoint: str, params: dict) -> dict | None:
+    """Make a request to the Redfin Stingray API and parse the JSON response."""
+    url = STINGRAY_BASE + endpoint
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        # Stingray responses are prefixed with "{}&&" to prevent JSON hijacking
+        text = resp.text
+        if text.startswith("{}&&"):
+            text = text[4:]
+        return json.loads(text)
+    except (requests.HTTPError, json.JSONDecodeError, Exception) as e:
+        logger.debug(f"Stingray request failed ({endpoint}): {e}")
+        return None
+
+
+def _get_property_id(url_path: str) -> tuple[int | None, int | None]:
+    """
+    Given a Redfin listing URL path (e.g. /UT/Lehi/123-Main-St/.../home/12345),
+    call initialInfo to get propertyId and listingId.
+    """
+    data = _stingray_request("api/home/details/initialInfo", {"path": url_path})
+    if not data or "payload" not in data:
+        return None, None
+    payload = data["payload"]
+    return payload.get("propertyId"), payload.get("listingId")
+
+
+def _get_listing_description(property_id: int) -> str | None:
+    """
+    Fetch the listing description/remarks via the belowTheFold endpoint.
+    Returns the full text description, or None if unavailable.
+    """
+    data = _stingray_request("api/home/details/belowTheFold", {
+        "propertyId": property_id,
+        "accessLevel": 1,
+        "pageType": 3,
+    })
+    if not data or "payload" not in data:
+        return None
+
+    payload = data["payload"]
+
+    # Try multiple known locations for the description text
+    for key_path in [
+        ("listingRemarks",),
+        ("publicRecordsInfo", "remarks"),
+    ]:
+        obj = payload
+        for k in key_path:
+            if isinstance(obj, dict):
+                obj = obj.get(k)
+            else:
+                obj = None
+                break
+        if obj and isinstance(obj, str) and len(obj) > 10:
+            return obj
+
+    # Some responses nest it differently
+    if isinstance(payload.get("listingRemarks"), dict):
+        return payload["listingRemarks"].get("remarks") or payload["listingRemarks"].get("value")
+
+    return None
+
+
+def fetch_listing_descriptions(
+    df: pd.DataFrame,
+    max_listings: int = 200,
+    url_col: str = "url",
+) -> pd.DataFrame:
+    """
+    Enrich a DataFrame with listing descriptions by hitting Redfin's detail API.
+
+    Only fetches descriptions for rows that have a URL and don't already have one.
+    Adds a 'description' column with the listing remarks text.
+
+    Args:
+        df:            DataFrame with a URL column pointing to Redfin listing pages.
+        max_listings:  Cap on how many listings to fetch (avoids hammering the API).
+        url_col:       Name of the column containing Redfin URLs.
+
+    Returns:
+        DataFrame with 'description' column added.
+    """
+    df = df.copy()
+    if "description" not in df.columns:
+        df["description"] = None
+
+    if url_col not in df.columns:
+        logger.info("No URL column found — skipping description enrichment.")
+        return df
+
+    # Only fetch for rows without descriptions that have URLs
+    needs_desc = df[
+        df["description"].isna() &
+        df[url_col].notna() &
+        (df[url_col].astype(str).str.len() > 10)
+    ]
+
+    if needs_desc.empty:
+        logger.info("All listings already have descriptions, or no URLs available.")
+        return df
+
+    to_fetch = needs_desc.head(max_listings)
+    logger.info(
+        f"Fetching descriptions for {len(to_fetch)} listings "
+        f"(of {len(needs_desc)} needing enrichment, capped at {max_listings})..."
+    )
+
+    fetched = 0
+    failed = 0
+    for idx, row in to_fetch.iterrows():
+        raw_url = str(row[url_col])
+
+        # Extract the path from a full Redfin URL
+        url_path = raw_url
+        if "redfin.com" in url_path:
+            url_path = url_path.split("redfin.com", 1)[1]
+
+        property_id, listing_id = _get_property_id(url_path)
+        if property_id is None:
+            failed += 1
+            time.sleep(DESCRIPTION_SLEEP)
+            continue
+
+        desc = _get_listing_description(property_id)
+        if desc:
+            df.at[idx, "description"] = desc
+            fetched += 1
+        else:
+            failed += 1
+
+        time.sleep(DESCRIPTION_SLEEP)
+
+    logger.info(
+        f"Description enrichment complete: {fetched} fetched, {failed} failed, "
+        f"{len(needs_desc) - len(to_fetch)} skipped (over cap)."
+    )
+    return df
 
 
 def _read_listing_csv(path: Path) -> pd.DataFrame:

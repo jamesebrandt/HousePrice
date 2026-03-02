@@ -41,7 +41,7 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_email: bool = True, use_sample: bool = False, refetch: bool = False):
+def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_email: bool = True, use_sample: bool = False, refetch: bool = False, export_report: bool = True):
     """
     Full pipeline:
       1. Fetch fresh listings from Redfin
@@ -51,15 +51,18 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
       5. Filter to your criteria
       6. Email (or print) the top deals
     """
-    from src.scraper import fetch_listings, load_all_raw_csv
+    from src.scraper import fetch_listings, load_all_raw_csv, fetch_listing_descriptions
     from src.features import prepare_dataset
     from src.model import train, load_model, predict
     from src.scorer import compute_value_scores, top_deals, score_summary
     from src.filter import apply_criteria, filter_summary, load_config as filter_load_config
-    from src.notifier import send_email as do_send_email, print_deals_to_console
+    from src.notifier import send_email as do_send_email, print_deals_to_console, send_staleness_alert
+    from src.reporter import build_html_report
     from src.bps_loader import load_bps_data, compute_permit_features, permit_feature_summary
     from src.zhvi_loader import load_zhvi_data, compute_zhvi_features, zhvi_feature_summary
     from src.acs_loader import load_acs_income, acs_income_summary
+    from src.data_staleness import check_all_staleness, stale_sources, staleness_summary
+    from src.adu import detect_adu_potential, estimate_adu_rent, compute_adu_affordability, adu_summary
 
     config = load_config(config_path)
     paths = config.get("paths", {})
@@ -69,9 +72,14 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     train_cfg = config.get("training", {})
     max_train_price = train_cfg.get("max_price")
 
+    holdout_path = model_path.replace(".joblib", "_holdout.joblib")
+
     scoring_cfg = config.get("scoring", {})
     min_value_score = scoring_cfg.get("min_value_score", 0.05)
     top_n = scoring_cfg.get("top_n_alerts", 5)
+
+    adu_cfg = config.get("adu", {})
+    adu_enabled = adu_cfg.get("enabled", True)
 
     notif_cfg = config.get("notifications", {})
     email_to   = notif_cfg.get("email_to")
@@ -149,6 +157,20 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     else:
         logger.info("No Census Data folder found — median income feature will be skipped.")
 
+    # 1e. Check data freshness and alert if supplemental sources are stale
+    logger.info("Step 1e: Checking data freshness...")
+    staleness_results = check_all_staleness(raw_dir=raw_dir, cfg=config)
+    logger.info(staleness_summary(staleness_results))
+
+    stale = stale_sources(staleness_results, exclude_redfin=True)
+    if stale and send_email and email_to and email_from:
+        send_staleness_alert(stale, email_to=email_to, email_from=email_from)
+    elif stale:
+        logger.warning(
+            f"{len(stale)} supplemental data source(s) are stale and need updating: "
+            + ", ".join(r["source"] for r in stale)
+        )
+
     # 2. Prepare features
     logger.info("Step 2: Cleaning and engineering features...")
     exclude_cities = search_cfg.get("exclude_cities") or []
@@ -159,6 +181,12 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
         income_map=income_map,
         exclude_cities=exclude_cities if exclude_cities else None,
     )
+    # Add structural ADU score to training data (keyword score needs descriptions,
+    # which we only fetch for active listings, but the structural heuristic works everywhere).
+    if adu_enabled:
+        from src.adu import _structural_score
+        prepared_df["adu_structural_score"] = prepared_df.apply(_structural_score, axis=1)
+
     prepared_df.to_csv(
         Path(paths.get("processed_data_dir", "data/processed")) / "prepared_listings.csv",
         index=False,
@@ -172,21 +200,35 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
         # sale prices are scarce. Require at least 500 to train on sold-only; otherwise
         # use all priced listings (active asking prices are a valid proxy for value).
         MIN_SOLD_ROWS = 500
+        training_mode: str
         if "sold" in prepared_df.columns:
             sold_df = prepared_df[prepared_df["sold"] == True]  # noqa: E712
         else:
             sold_df = prepared_df
-        if len(sold_df) < MIN_SOLD_ROWS:
+
+        if len(sold_df) >= MIN_SOLD_ROWS:
+            training_mode = "sold-only"
+            logger.info(
+                f"Training mode: SOLD-ONLY — {len(sold_df):,} sold listings "
+                f"with confirmed sale prices (≥{MIN_SOLD_ROWS} threshold met)."
+            )
+        else:
             logger.warning(
-                f"Only {len(sold_df)} sold listings with prices (need ≥{MIN_SOLD_ROWS}) — "
-                "using all priced listings for training."
+                f"Training mode: MIXED — only {len(sold_df):,} sold listings "
+                f"(need ≥{MIN_SOLD_ROWS}). Falling back to all {len(prepared_df):,} "
+                "priced listings, which includes active asking prices. "
+                "Model may learn asking-price patterns rather than sale prices. "
+                "Add more sold CSV exports to fix this."
             )
             sold_df = prepared_df
-        logger.info(f"Training on {len(sold_df):,} rows.")
+            training_mode = "mixed (asking + sold)"
+
+        logger.info(f"Training on {len(sold_df):,} rows  [mode: {training_mode}].")
         model, feature_cols, results = train(
             sold_df,
             model_path=model_path,
             feature_path=feature_path,
+            holdout_path=holdout_path,
             max_price=max_train_price,
         )
     else:
@@ -208,6 +250,31 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     scored_df = compute_value_scores(active_df, predicted)
     logger.info(score_summary(scored_df))
 
+    # 4b. ADU detection and affordability
+    if adu_enabled:
+        logger.info("Step 4b: ADU detection and affordability analysis...")
+
+        # Enrich active listings with descriptions from Redfin detail pages
+        url_col = "url" if "url" in scored_df.columns else None
+        if url_col:
+            max_fetches = adu_cfg.get("max_description_fetches", 200)
+            scored_df = fetch_listing_descriptions(scored_df, max_listings=max_fetches, url_col=url_col)
+
+        # Detect ADU potential (keywords + structural heuristics)
+        scored_df = detect_adu_potential(scored_df)
+
+        # Estimate rent for likely ADU listings
+        default_rent = adu_cfg.get("default_adu_rent")
+        scored_df = estimate_adu_rent(scored_df, default_rent=default_rent)
+
+        # Compute mortgage and net monthly cost
+        fred_path = str(Path(raw_dir) / "FRED Data" / "MORTGAGE30US.csv")
+        scored_df = compute_adu_affordability(scored_df, adu_cfg=adu_cfg, fred_path=fred_path)
+
+        logger.info(adu_summary(scored_df))
+    else:
+        logger.info("Step 4b: ADU detection disabled in config.")
+
     # 5. Apply your criteria
     logger.info("Step 5: Applying your criteria...")
     filtered_df = apply_criteria(scored_df, config)
@@ -226,6 +293,12 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     elif send_email:
         logger.warning("Email skipped — set email_to and email_from in config.yaml")
 
+    if export_report:
+        report_name = f"home_finder_{datetime.now().strftime('%Y-%m-%d')}.html"
+        report_path = Path("reports") / report_name
+        saved = build_html_report(deals, filtered_df, output_path=report_path)
+        logger.info(f"HTML report → {saved.resolve()}")
+
     logger.info("Run complete.")
 
 
@@ -235,6 +308,7 @@ def main():
     parser.add_argument("--schedule", action="store_true", help="Run on a daily schedule.")
     parser.add_argument("--retrain", action="store_true", help="Retrain the model before running.")
     parser.add_argument("--no-email", action="store_true", help="Print results to console only, skip email.")
+    parser.add_argument("--no-report", action="store_true", help="Skip saving the HTML report to reports/.")
     parser.add_argument("--use-sample", action="store_true", help="Use generated sample data instead of live Redfin fetch.")
     parser.add_argument("--refetch", action="store_true", help="Force live Redfin API fetch even if cached CSVs exist.")
     parser.add_argument("--config", default="config.yaml", help="Path to config YAML (default: config.yaml).")
@@ -244,11 +318,12 @@ def main():
     send_email_flag = not args.no_email
     use_sample_flag = args.use_sample
     refetch_flag = args.refetch
+    export_report_flag = not args.no_report
 
     if args.run_now:
         run_pipeline(config_path=args.config, retrain=args.retrain,
                      send_email=send_email_flag, use_sample=use_sample_flag,
-                     refetch=refetch_flag)
+                     refetch=refetch_flag, export_report=export_report_flag)
 
     if args.schedule:
         schedule.every().day.at(args.time).do(
@@ -257,9 +332,10 @@ def main():
             retrain=False,
             send_email=send_email_flag,
             use_sample=use_sample_flag,
-            refetch=False,
+            refetch=True,   # always pull fresh Redfin listings on scheduled runs
+            export_report=export_report_flag,
         )
-        logger.info(f"Scheduler started. Next run at {args.time} daily. Press Ctrl+C to stop.")
+        logger.info(f"Scheduler started. Will refetch + run daily at {args.time}. Press Ctrl+C to stop.")
         try:
             while True:
                 schedule.run_pending()
