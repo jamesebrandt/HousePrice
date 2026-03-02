@@ -109,4 +109,3 @@ paths:
   raw_data_dir: "data/raw"
   processed_data_dir: "data/processed"
   model_path: "models/hedonic_model.joblib"
-  scaler_path: "models/scaler.joblib"

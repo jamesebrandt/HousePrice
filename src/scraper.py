@@ -176,8 +176,8 @@ def _fetch_all_pages(
         if df is None or len(df) == 0:
             break
 
-        # Validate state — Redfin region IDs are not stable and can silently
-        # resolve to out-of-state locations. Drop non-Utah rows.
+        # Redfin region IDs are unstable and can silently resolve to out-of-state
+        # locations — validate and drop non-Utah rows.
         if "STATE OR PROVINCE" in df.columns:
             ut_rows = df[df["STATE OR PROVINCE"].str.upper() == "UT"]
             if len(ut_rows) == 0:
@@ -189,8 +189,6 @@ def _fetch_all_pages(
                 break
             df = ut_rows
 
-        # Prefer the CITY column Redfin embeds in new-format CSVs;
-        # fall back to our manual city_tag for old-format CSVs.
         if "CITY" in df.columns and df["CITY"].notna().any():
             df["city"] = df["CITY"].fillna(city_tag)
         else:
@@ -256,7 +254,6 @@ def fetch_listings(
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     frames = []
 
-    # ── City-level searches ───────────────────────────────────────────────────
     for city in cities:
         if city not in CITY_REGIONS:
             logger.warning(f"No region ID for '{city}' — skipping city search.")
@@ -289,7 +286,6 @@ def fetch_listings(
         )
         return pd.DataFrame()
 
-    # ── Combine and deduplicate ───────────────────────────────────────────────
     combined = pd.concat(frames, ignore_index=True)
     logger.info(f"Raw combined rows (before dedup): {len(combined):,}")
     combined = _deduplicate(combined)
@@ -442,7 +438,6 @@ def fetch_listing_descriptions(
         logger.info("No URL column found — skipping description enrichment.")
         return df
 
-    # ── Load cache and fill any already-cached descriptions ──────────────────
     cache = _load_description_cache()
     cache_hits = 0
     for idx, row in df.iterrows():
@@ -454,7 +449,6 @@ def fetch_listing_descriptions(
     if cache_hits:
         logger.info(f"Description cache: {cache_hits} hit(s) loaded from disk.")
 
-    # ── Identify rows still needing enrichment ────────────────────────────────
     needs_desc = df[
         df["description"].isna() &
         df[url_col].notna() &
@@ -477,7 +471,6 @@ def fetch_listing_descriptions(
     failed = 0
     aborted = False
 
-    # Map idx → url for the work items
     work_items = [(idx, str(row[url_col])) for idx, row in to_fetch.iterrows()]
 
     with ThreadPoolExecutor(max_workers=DESCRIPTION_WORKERS) as executor:
@@ -504,7 +497,6 @@ def fetch_listing_descriptions(
             else:
                 failed += 1
 
-            # Progress log every 25 completions
             if completed == 1 or completed % 25 == 0 or completed == total:
                 logger.info(
                     f"  Descriptions: {completed}/{total} "
@@ -526,7 +518,6 @@ def fetch_listing_descriptions(
                     aborted = True
                     break
 
-    # Persist any newly fetched descriptions to disk
     if fetched:
         _save_description_cache(cache)
         logger.info(f"  Saved {fetched} new description(s) to cache.")
@@ -589,7 +580,6 @@ def load_all_raw_csv(raw_dir: str = "data/raw") -> pd.DataFrame:
         try:
             df = _read_listing_csv(f)
 
-            # Derive city from filename when not present as a column
             if "city" not in df.columns and "CITY" not in df.columns:
                 name = (f.stem
                         .replace("_active", "").replace("_sold", "")
@@ -600,7 +590,6 @@ def load_all_raw_csv(raw_dir: str = "data/raw") -> pd.DataFrame:
             if "sold" not in df.columns:
                 df["sold"] = "_sold" in f.stem
 
-            # Skip files that don't look like Redfin listing exports
             listing_signals = {"PRICE", "BEDS", "SALE TYPE", "price", "beds"}
             if not listing_signals.intersection(df.columns):
                 logger.info(f"Skipping {f.name} — not a listing CSV (no PRICE/BEDS column).")

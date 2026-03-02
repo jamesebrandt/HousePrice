@@ -75,16 +75,10 @@ def compute_value_scores(df: pd.DataFrame, predicted_prices: np.ndarray) -> pd.D
     """
     df = df.copy()
 
-    # Market-normalize predictions so that the median listing sits at "fairly
-    # priced" (value_score ≈ 0).  The model is trained on historical comps
-    # whose asking prices may reflect a different market level than today's
-    # active listings.  Without this step the model may systematically
-    # label most listings as "undervalued" or "overpriced".
-    #
-    # Method: compute the per-listing ratio actual/predicted, then scale all
-    # predictions by the median ratio.  This centres value scores around
-    # zero while preserving the relative ordering (which homes are cheaper
-    # *for what they are* compared to peers).
+    # Market-normalise: scale predictions by the median actual/predicted ratio
+    # so the median listing sits at value_score ≈ 0. This prevents the model
+    # from systematically labelling all listings as under/overpriced when there
+    # is a level gap between training comps and today's market.
     ratios = df["price"].values / predicted_prices
     finite_ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
     if len(finite_ratios) >= 10:
@@ -98,25 +92,21 @@ def compute_value_scores(df: pd.DataFrame, predicted_prices: np.ndarray) -> pd.D
     df["predicted_price"] = predicted_prices
     df = _flag_low_confidence(df)
 
-    # Core value score: fraction below predicted
     df["pct_below_market"] = (df["predicted_price"] - df["price"]) / df["predicted_price"] * 100
-    df["value_score"] = df["pct_below_market"] / 100  # as a ratio
+    df["value_score"] = df["pct_below_market"] / 100
 
-    # Features-per-dollar scores (normalized 0–1 across the dataset)
     if "sqft" in df.columns:
         df["sqft_per_dollar"] = df["sqft"] / df["price"]
         df["sqft_per_dollar_norm"] = _normalize(df["sqft_per_dollar"])
     else:
         df["sqft_per_dollar_norm"] = 0.0
 
-    # Beds + baths per $100k
     if "beds" in df.columns and "baths" in df.columns:
         df["rooms_per_100k"] = (df["beds"] + df["baths"]) / (df["price"] / 100_000)
         df["rooms_per_100k_norm"] = _normalize(df["rooms_per_100k"])
     else:
         df["rooms_per_100k_norm"] = 0.0
 
-    # ADU affordability bonus: fraction of mortgage offset by ADU rent
     has_adu_data = "estimated_adu_rent" in df.columns and "estimated_mortgage" in df.columns
     if has_adu_data:
         safe_mortgage = df["estimated_mortgage"].replace(0, np.nan)

@@ -28,8 +28,6 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# ── Keyword patterns for description-based ADU detection ─────────────────────
-
 _ADU_KEYWORDS = [
     r"mother[\s\-]?in[\s\-]?law",
     r"\badu\b",
@@ -95,7 +93,6 @@ def _keyword_score(description: str) -> float:
     if not matches:
         return 0.0
 
-    # Any strong keyword is high-confidence; multiple strong keywords is near-certain
     if len(strong) >= 3:
         return 1.0
     if len(strong) >= 2:
@@ -103,7 +100,6 @@ def _keyword_score(description: str) -> float:
     if strong:
         return min(0.55 + 0.1 * len(matches), 0.95)
 
-    # Weak keywords only — suggestive but not conclusive
     return min(0.25 + 0.1 * len(matches), 0.65)
 
 
@@ -129,8 +125,6 @@ def _structural_score(row: pd.Series) -> float:
 
     total_rooms = beds + baths
 
-    # Tier 1: Very high room counts — near-certain ADU
-    # A 9bd/6ba or 8bd/5ba home effectively IS two units.
     if total_rooms >= 14:
         score += 0.50
     elif total_rooms >= 11:
@@ -138,9 +132,7 @@ def _structural_score(row: pd.Series) -> float:
     elif total_rooms >= 9:
         score += 0.20
 
-    # Excess baths beyond typical single-family pattern.
-    # Rule of thumb: a normal SFH has ~0.5–0.6 baths per bed.
-    # Anything significantly above that suggests a second bathroom set.
+    # Normal SFH has ~0.5–0.6 baths/bed; excess suggests a second bathroom set
     if beds > 0:
         expected_baths = 1.0 + (beds - 1) * 0.5  # e.g. 4bd → 2.5ba expected
         excess_baths = baths - expected_baths
@@ -149,11 +141,9 @@ def _structural_score(row: pd.Series) -> float:
         elif excess_baths >= 1.0:
             score += 0.10
 
-    # Bath-to-bed ratio >= 1.0 (every bedroom has its own bath = suite-style)
     if beds > 0 and baths / beds >= 0.9:
         score += 0.10
 
-    # Large home + many bedrooms (>= 3500sqft with 6+ beds)
     if pd.notna(sqft):
         if sqft >= 4000 and beds >= 7:
             score += 0.15
@@ -184,9 +174,7 @@ def detect_adu_potential(df: pd.DataFrame) -> pd.DataFrame:
 
     df["adu_structural_score"] = df.apply(_structural_score, axis=1)
 
-    # Combine: take the max of the two signals, then add a small bonus when both agree.
-    # This way keywords alone or structure alone can reach high confidence,
-    # and having both is even stronger.
+    # Max of both signals + small bonus when both agree
     kw = df["adu_keyword_score"]
     st = df["adu_structural_score"]
     base = pd.concat([kw, st], axis=1).max(axis=1)
@@ -205,8 +193,6 @@ def detect_adu_potential(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── ADU size estimation ──────────────────────────────────────────────────────
-
 def _estimate_adu_beds(row: pd.Series) -> int:
     """
     Estimate how many bedrooms are in the ADU portion of the home.
@@ -219,17 +205,12 @@ def _estimate_adu_beds(row: pd.Series) -> int:
     if not pd.notna(beds) or beds < 4:
         return 1  # minimum: assume at least a studio/1-bed ADU
 
-    # For homes with 4–6 beds, assume ADU has beds - 3 (main home keeps 3)
-    # For homes with 7+ beds, assume roughly half in the ADU
     main_beds = min(4, math.ceil(beds * 0.5))
     adu_beds = max(1, int(beds - main_beds))
     return min(adu_beds, 5)  # cap at 5; beyond that the estimate gets unreliable
 
 
-# ── Rent estimation ──────────────────────────────────────────────────────────
-
-# Base rents by ZIP for a **1-bed** ADU in Utah County (2025-2026).
-# Scaled up by bed count in the estimation function.
+# Base monthly rent for a 1-bed ADU by ZIP in Utah County (2025–2026).
 _UT_BASE_RENT_1BR = {
     "84003": 1050,   # American Fork
     "84004": 1100,   # Alpine / Highland
@@ -251,8 +232,6 @@ _UT_BASE_RENT_1BR = {
 }
 _DEFAULT_BASE_RENT_1BR = 1000
 
-# Per-bedroom rent multipliers relative to 1BR base.
-# Source: typical Utah County rental market spread.
 _BED_MULTIPLIER = {
     1: 1.00,
     2: 1.35,
@@ -301,8 +280,6 @@ def estimate_adu_rent(
     )
     return df
 
-
-# ── Mortgage estimation ──────────────────────────────────────────────────────
 
 def _load_mortgage_rate(fred_path: str | None = None) -> float:
     """Load most recent 30-year fixed rate from FRED CSV, or return a fallback."""

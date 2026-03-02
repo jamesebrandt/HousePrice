@@ -10,6 +10,7 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from src.bps_loader import get_county_fips
 
 logger = logging.getLogger(__name__)
 
@@ -159,19 +160,17 @@ def engineer_features(
         zhvi_features: optional dict from zhvi_loader.compute_zhvi_features()
             city (str) → {zhvi_current, zhvi_yoy_pct, zhvi_3yr_cagr, zhvi_5yr_cagr, zhvi_momentum}
     """
-    from src.bps_loader import get_county_fips
-
     current_year = datetime.now().year
 
     if "year_built" in df.columns:
         df["feat_home_age"] = current_year - df["year_built"]
 
-    # ── Days since sale (recency — used for temporal weighting in training) ────
+    # Days since sale — used for exponential recency weighting during training.
+    # Active listings have no sold_date; fill with 0 (weight is not applied to them).
     if "sold_date" in df.columns:
         today = pd.Timestamp.today().normalize()
         sold_dt = pd.to_datetime(df["sold_date"], errors="coerce")
         df["feat_days_since_sale"] = (today - sold_dt).dt.days.clip(lower=0)
-        # Active/unsold listings have no sold_date — fill with 0 (not used in training)
         df["feat_days_since_sale"] = df["feat_days_since_sale"].fillna(0).astype(int)
 
     if "sqft" in df.columns and "beds" in df.columns:
@@ -188,8 +187,7 @@ def engineer_features(
         df["days_on_market"] = df["days_on_market"].fillna(0)
         df["feat_long_on_market"] = (df["days_on_market"] > 60).astype(int)
 
-    # ── City-level Zillow ZHVI appreciation features ───────────────────────
-    # Direct appreciation signal: YoY, 3yr CAGR, 5yr CAGR, and short-term momentum.
+    # City-level ZHVI: YoY, 3yr/5yr CAGR, and short-term momentum
     if zhvi_features and "city" in df.columns:
         zhvi_keys = ["zhvi_current", "zhvi_yoy_pct", "zhvi_3yr_cagr", "zhvi_5yr_cagr", "zhvi_momentum"]
         for key in zhvi_keys:
@@ -199,8 +197,7 @@ def engineer_features(
         mapped = df["city"].apply(lambda c: str(c) in zhvi_features).sum()
         logger.info(f"ZHVI features joined for {mapped:,} / {len(df):,} listings.")
 
-    # ── County-level building permit features ──────────────────────────────
-    # These signal neighborhood demand growth and are strong appreciation proxies.
+    # County-level permit counts — proxy for neighborhood demand growth
     if permit_features and "city" in df.columns:
         def _permits(city, key, default):
             fips = get_county_fips(str(city))
@@ -217,15 +214,13 @@ def engineer_features(
         mapped = df["city"].apply(lambda c: get_county_fips(str(c)) is not None).sum()
         logger.info(f"Permit features joined for {mapped:,} / {len(df):,} listings.")
 
-    # ── ZIP-level Census median household income ───────────────────────────
-    # Strongest sub-city price signal: wealthier ZIP → higher prices.
+    # ZIP-level median income — strongest sub-city price signal
     if income_map and "zip_code" in df.columns:
         zip5 = df["zip_code"].astype(str).str[:5]
         df["feat_median_income"] = zip5.map(income_map).fillna(0.0)
         matched = (df["feat_median_income"] > 0).sum()
         logger.info(f"ACS income joined for {matched:,} / {len(df):,} listings.")
 
-    # ── One-hot encode city and zip ─────────────────────────────────────────
     if "city" in df.columns:
         city_dummies = pd.get_dummies(df["city"], prefix="city", drop_first=False)
         df = pd.concat([df, city_dummies], axis=1)
@@ -286,7 +281,6 @@ def prepare_dataset(
     df = standardize_columns(df)
     df = clean_numeric(df)
 
-    # ── Exclude specific cities (outliers or places you don't care about) ─────
     if exclude_cities and "city" in df.columns:
         exclude_set = {str(c).strip() for c in exclude_cities}
         before_excl = len(df)
@@ -295,13 +289,10 @@ def prepare_dataset(
         if removed:
             logger.info(f"Excluded {removed:,} listings in {exclude_set}. Remaining: {len(df):,}")
 
-    # ── Deduplicate ────────────────────────────────────────────────────────────
-    # Multiple downloaded files can overlap geographically, producing the same
-    # listing in more than one CSV. Deduplicate before feature engineering so
-    # duplicates don't inflate training counts or appear twice in results.
+    # Deduplicate — multiple CSVs often overlap geographically.
+    # Keep the row with the most complete data (fewest NaNs) for each MLS#.
     before_dedup = len(df)
     if "mls_id" in df.columns:
-        # Keep the row with the most complete data (fewest NaNs) for each MLS#
         df = (df
               .assign(_null_count=df.isnull().sum(axis=1))
               .sort_values("_null_count")
@@ -309,7 +300,6 @@ def prepare_dataset(
               .drop(columns=["_null_count"])
               .reset_index(drop=True))
     else:
-        # Fallback: deduplicate on address + price + beds
         addr_col = next((c for c in ["address", "location", "neighborhood"] if c in df.columns), None)
         if addr_col:
             df = df.drop_duplicates(subset=[addr_col, "price", "beds"], keep="first").reset_index(drop=True)
@@ -319,24 +309,21 @@ def prepare_dataset(
 
     df = engineer_features(df, permit_features=permit_features, zhvi_features=zhvi_features, income_map=income_map)
 
-    # Normalize the sold column — CSV round-trips turn booleans into strings
+    # CSV round-trips turn booleans into strings — normalize back
     if "sold" in df.columns:
         df["sold"] = df["sold"].map(
             {True: True, False: False, "True": True, "False": False,
              "true": True, "false": False, 1: True, 0: False}
         ).fillna(False)
 
-    # Drop rows without a price (the target variable)
     before = len(df)
     df = df.dropna(subset=["price"])
     logger.info(f"Dropped {before - len(df)} rows with missing price. Remaining: {len(df)}")
 
-    # Drop rows with obviously wrong prices
     df = df[df["price"] > 50_000]
     df = df[df["price"] < 5_000_000]
 
     if drop_outliers:
-        # IQR-based outlier removal on price
         q1, q3 = df["price"].quantile(0.01), df["price"].quantile(0.99)
         df = df[(df["price"] >= q1) & (df["price"] <= q3)]
         logger.info(f"After outlier removal: {len(df)} rows")

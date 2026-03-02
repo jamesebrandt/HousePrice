@@ -19,13 +19,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-import yaml
-
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.features import prepare_dataset, get_model_feature_cols
 from src.scorer import compute_value_scores, top_deals
-from src.filter import apply_criteria
+from src.filter import apply_criteria, load_config
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -60,11 +58,6 @@ def get_model():
         )
     except FileNotFoundError:
         return None, None
-
-
-def load_config(path: str = "config.yaml") -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
 
 
 def fmt_price(v) -> str:

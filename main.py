@@ -26,7 +26,8 @@ from pathlib import Path
 from datetime import datetime
 
 import schedule
-import yaml
+
+from src.filter import load_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,11 +35,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-
-def load_config(config_path: str) -> dict:
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
 
 
 def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_email: bool = True, use_sample: bool = False, refetch: bool = False, export_report: bool = True):
@@ -55,7 +51,7 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     from src.features import prepare_dataset
     from src.model import train, load_model, predict
     from src.scorer import compute_value_scores, top_deals, score_summary
-    from src.filter import apply_criteria, filter_summary, load_config as filter_load_config
+    from src.filter import apply_criteria
     from src.notifier import send_email as do_send_email, print_deals_to_console, send_staleness_alert
     from src.reporter import build_html_report
     from src.bps_loader import load_bps_data, compute_permit_features, permit_feature_summary
@@ -65,63 +61,53 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     from src.adu import detect_adu_potential, estimate_adu_rent, compute_adu_affordability, adu_summary
 
     config = load_config(config_path)
-    paths = config.get("paths", {})
-    model_path   = paths.get("model_path", "models/hedonic_model.joblib")
-    feature_path = model_path.replace(".joblib", "_features.joblib")
-
-    train_cfg = config.get("training", {})
-    max_train_price = train_cfg.get("max_price")
-
-    holdout_path = model_path.replace(".joblib", "_holdout.joblib")
-
-    scoring_cfg = config.get("scoring", {})
+    paths           = config.get("paths", {})
+    model_path      = paths.get("model_path", "models/hedonic_model.joblib")
+    feature_path    = model_path.replace(".joblib", "_features.joblib")
+    holdout_path    = model_path.replace(".joblib", "_holdout.joblib")
+    max_train_price = config.get("training", {}).get("max_price")
+    scoring_cfg     = config.get("scoring", {})
     min_value_score = scoring_cfg.get("min_value_score", 0.05)
-    top_n = scoring_cfg.get("top_n_alerts", 5)
-
-    adu_cfg = config.get("adu", {})
-    adu_enabled = adu_cfg.get("enabled", True)
-
-    notif_cfg = config.get("notifications", {})
-    email_to   = notif_cfg.get("email_to")
-    email_from = notif_cfg.get("email_from")
+    top_n           = scoring_cfg.get("top_n_alerts", 5)
+    adu_cfg         = config.get("adu", {})
+    adu_enabled     = adu_cfg.get("enabled", True)
+    notif_cfg       = config.get("notifications", {})
+    email_to        = notif_cfg.get("email_to")
+    email_from      = notif_cfg.get("email_from")
 
     logger.info("=" * 60)
     logger.info(f"Home Finder run started: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     logger.info("=" * 60)
 
-    # 1. Fetch data
-    search_cfg = config.get("search", {})
+    search_cfg      = config.get("search", {})
     training_cities = search_cfg.get("training_cities", search_cfg.get("cities", []))
     target_cities   = search_cfg.get("cities", [])
+    raw_dir         = paths.get("raw_data_dir", "data/raw")
 
-    raw_dir = paths.get("raw_data_dir", "data/raw")
+    # ── Step 1: Fetch listings ────────────────────────────────────────────────
     logger.info("Step 1: Fetching listings...")
-
     cached_csvs = list(Path(raw_dir).glob("*.csv"))
-
     if refetch:
-        cached_csvs = []  # force live fetch even if CSVs exist
+        cached_csvs = []
 
     if use_sample:
         logger.info("Generating sample data (--use-sample flag).")
         from src.generate_sample_data import generate
         raw_df = generate(save_dir=raw_dir, verbose=True)
     elif cached_csvs:
-        # Use downloaded CSVs directly — skip unreliable live API calls.
         logger.info(f"Found {len(cached_csvs)} cached CSV(s) in {raw_dir} — loading without live fetch.")
         logger.info("(Pass --refetch to force a fresh API download instead.)")
         raw_df = load_all_raw_csv(raw_dir)
     else:
         logger.info("No cached CSVs found — attempting live fetch from Redfin...")
         raw_df = fetch_listings(cities=training_cities, include_sold=True, save_dir=raw_dir)
-
         if raw_df.empty:
             logger.warning("Live fetch returned no Utah data. Falling back to sample data.")
             logger.warning("See data/DOWNLOAD_GUIDE.md to download real listings manually.")
             from src.generate_sample_data import generate
             raw_df = generate(save_dir=raw_dir, verbose=True)
 
-    # 1b. Load building permit features (Census BPS data)
+    # ── Step 1b–1d: Load supplemental data sources ───────────────────────────
     permit_features: dict = {}
     bps_dir = str(Path(raw_dir) / "BPS Data")
     if Path(bps_dir).exists():
@@ -133,7 +119,6 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     else:
         logger.info("No BPS Data folder found — permit features will be skipped.")
 
-    # 1c. Load city-level Zillow ZHVI appreciation features
     zhvi_features: dict = {}
     zhvi_dir = str(Path(raw_dir) / "Zillow Data")
     if Path(zhvi_dir).exists():
@@ -141,12 +126,10 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
         zhvi_df = load_zhvi_data(zhvi_dir, state=search_cfg.get("state", "UT"))
         if not zhvi_df.empty:
             zhvi_features = compute_zhvi_features(zhvi_df)
-            target_cities = search_cfg.get("cities", [])
             logger.info(zhvi_feature_summary(zhvi_features, cities=target_cities))
     else:
         logger.info("No Zillow Data folder found — ZHVI features will be skipped.")
 
-    # 1d. Load ZIP-level median household income (Census ACS B19013)
     income_map: dict = {}
     census_dir = str(Path(raw_dir) / "Census Data")
     if Path(census_dir).exists():
@@ -157,7 +140,6 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     else:
         logger.info("No Census Data folder found — median income feature will be skipped.")
 
-    # 1e. Check data freshness and alert if supplemental sources are stale
     logger.info("Step 1e: Checking data freshness...")
     staleness_results = check_all_staleness(raw_dir=raw_dir, cfg=config)
     logger.info(staleness_summary(staleness_results))
@@ -171,7 +153,7 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
             + ", ".join(r["source"] for r in stale)
         )
 
-    # 2. Prepare features
+    # ── Step 2: Prepare features ──────────────────────────────────────────────
     logger.info("Step 2: Cleaning and engineering features...")
     exclude_cities = search_cfg.get("exclude_cities") or []
     prepared_df = prepare_dataset(
@@ -181,8 +163,8 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
         income_map=income_map,
         exclude_cities=exclude_cities if exclude_cities else None,
     )
-    # Add structural ADU score to training data (keyword score needs descriptions,
-    # which we only fetch for active listings, but the structural heuristic works everywhere).
+    # Keyword ADU score requires descriptions (fetched for active listings only);
+    # structural score works everywhere, so add it to the full training set here.
     if adu_enabled:
         from src.adu import _structural_score
         prepared_df["adu_structural_score"] = prepared_df.apply(_structural_score, axis=1)
@@ -192,13 +174,12 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
         index=False,
     )
 
-    # 3. Train or load model
+    # ── Step 3: Train or load model ───────────────────────────────────────────
     if retrain or not Path(model_path).exists():
         logger.info("Step 3: Training hedonic pricing model...")
-        # Train on sold listings (ground truth prices)
-        # Redfin's new sold CSV format often has blank PRICE, so "sold" rows with actual
-        # sale prices are scarce. Require at least 500 to train on sold-only; otherwise
-        # use all priced listings (active asking prices are a valid proxy for value).
+        # Utah MLS rules mean sold CSVs often have blank PRICE. Require ≥500 sold rows
+        # with confirmed prices before training on sold-only; otherwise fall back to
+        # all priced listings (active asking prices are a valid proxy for value).
         MIN_SOLD_ROWS = 500
         training_mode: str
         if "sold" in prepared_df.columns:
@@ -235,7 +216,7 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
         logger.info("Step 3: Loading existing model...")
         model, feature_cols = load_model(model_path, feature_path)
 
-    # 4. Score active listings in target cities
+    # ── Step 4: Score active listings ─────────────────────────────────────────
     logger.info("Step 4: Scoring active listings...")
     active_df = prepared_df[
         (prepared_df.get("sold", False) == False) &  # noqa: E712
@@ -250,40 +231,30 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     scored_df = compute_value_scores(active_df, predicted)
     logger.info(score_summary(scored_df))
 
-    # 4b. ADU detection and affordability
+    # ── Step 4b: ADU detection ────────────────────────────────────────────────
     if adu_enabled:
         logger.info("Step 4b: ADU detection and affordability analysis...")
-
-        # Enrich active listings with descriptions from Redfin detail pages
         url_col = "url" if "url" in scored_df.columns else None
         if url_col:
             max_fetches = adu_cfg.get("max_description_fetches", 200)
             scored_df = fetch_listing_descriptions(scored_df, max_listings=max_fetches, url_col=url_col)
-
-        # Detect ADU potential (keywords + structural heuristics)
         scored_df = detect_adu_potential(scored_df)
-
-        # Estimate rent for likely ADU listings
         default_rent = adu_cfg.get("default_adu_rent")
         scored_df = estimate_adu_rent(scored_df, default_rent=default_rent)
-
-        # Compute mortgage and net monthly cost
         fred_path = str(Path(raw_dir) / "FRED Data" / "MORTGAGE30US.csv")
         scored_df = compute_adu_affordability(scored_df, adu_cfg=adu_cfg, fred_path=fred_path)
-
         logger.info(adu_summary(scored_df))
     else:
         logger.info("Step 4b: ADU detection disabled in config.")
 
-    # 5. Apply your criteria
+    # ── Step 5: Filter ────────────────────────────────────────────────────────
     logger.info("Step 5: Applying your criteria...")
     filtered_df = apply_criteria(scored_df, config)
-
     if filtered_df.empty:
         logger.info("No listings matched your criteria today.")
         return
 
-    # 6. Get top deals and notify
+    # ── Step 6: Notify ────────────────────────────────────────────────────────
     logger.info("Step 6: Selecting top deals and sending alert...")
     deals = top_deals(filtered_df, min_value_score=min_value_score, top_n=top_n)
     print_deals_to_console(deals)
@@ -339,11 +310,8 @@ def main():
             logger.error(f"Reports directory {web_dir} does not exist. Run with --run-now first.")
             sys.exit(1)
 
-        # Change to the reports directory to serve files from there
         os.chdir(web_dir)
-        
         Handler = http.server.SimpleHTTPRequestHandler
-        # Allow reusing the address to avoid "Address already in use" errors
         socketserver.TCPServer.allow_reuse_address = True
         
         server_started = False
@@ -365,11 +333,11 @@ def main():
                     raise
             except KeyboardInterrupt:
                 print("\nServer stopped.")
-                server_started = True # Handled gracefully
+                server_started = True
                 break
-        
+
         if not server_started:
-             logger.error(f"Could not find an open port between {start_port} and {end_port}. Please free up a port and try again.")
+            logger.error(f"Could not find an open port between {start_port} and {end_port}. Please free up a port and try again.")
 
     if args.schedule:
         schedule.every().day.at(args.time).do(

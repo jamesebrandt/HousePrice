@@ -12,6 +12,7 @@ Usage:
 import base64
 import json
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -78,7 +79,6 @@ def _model_info_html(m: dict) -> str:
             std_d  = v["CV_RMSE_std_dollar"]
             cv_parts.append(f"{k}: ${rmse_d/1e3:.0f}K ± ${std_d/1e3:.0f}K")
         elif "CV_RMSE_mean" in v and median_price > 0:
-            import math
             rmse_d = (math.exp(v["CV_RMSE_mean"]) - 1) * median_price
             std_d  = (math.exp(v["CV_RMSE_std"]) - 1) * median_price
             cv_parts.append(f"{k}: ${rmse_d/1e3:.0f}K ± ${std_d/1e3:.0f}K")

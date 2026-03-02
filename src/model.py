@@ -199,7 +199,6 @@ def train(
     y = np.log(y_dollar)
     cities_all = df["city"].values if "city" in df.columns else np.full(len(df), "unknown")
 
-    # ── Temporal recency weights ───────────────────────────────────────────────
     sample_weight = None
     if "feat_days_since_sale" in df.columns:
         days = df["feat_days_since_sale"].fillna(730).values.astype(float)
@@ -211,7 +210,7 @@ def train(
             f"weight range [{sample_weight.min():.3f}, {sample_weight.max():.3f}]"
         )
 
-    # ── Reserve a final holdout (never used for model selection or fitting) ────
+    # Reserve 15% holdout — never touched during model selection or fitting
     indices = np.arange(len(X))
     price_quintile = pd.qcut(y_dollar, q=5, labels=False, duplicates="drop")
     idx_train, idx_holdout = train_test_split(
@@ -227,7 +226,6 @@ def train(
     candidates = _build_candidates()
     results: dict = {}
 
-    # ── Multi-metric k-fold CV for model architecture selection ───────────────
     cv_splitter = KFold(n_splits=n_cv_folds, shuffle=True, random_state=random_state)
     scoring = {
         "neg_rmse": "neg_root_mean_squared_error",
@@ -268,7 +266,6 @@ def train(
             f"log-MAE = {cv_mae_mean:.4f}  MAPE(log) = {cv_mape_mean:.2f}%"
         )
 
-    # ── Pick best by mean CV RMSE on log-price ────────────────────────────────
     best_name = min(results, key=lambda n: results[n]["CV_RMSE_mean"])
     best_model = candidates[best_name]
     logger.info(
@@ -276,14 +273,12 @@ def train(
         f"(CV log-RMSE={results[best_name]['CV_RMSE_mean']:.4f})"
     )
 
-    # ── Refit winner on full training set (with recency weights if available) ─
     logger.info(f"Refitting {best_name} on {len(X_train):,} training rows…")
     if w_train is not None:
         best_model.fit(X_train, y_train, model__sample_weight=w_train)
     else:
         best_model.fit(X_train, y_train)
 
-    # ── Evaluate on the reserved holdout (dollar-space metrics) ───────────────
     holdout_metrics = evaluate_model(
         best_model, X_holdout, y_holdout, log_target=True,
     )
@@ -295,7 +290,6 @@ def train(
         f"RMSE/MAE={holdout_metrics['RMSE']/max(holdout_metrics['MAE'],1):.2f}"
     )
 
-    # ── Compute Duan smearing factor for the final model ──────────────────────
     y_pred_train_log = best_model.predict(X_train)
     log_residuals = y_train - y_pred_train_log
     smearing_factor = float(np.exp(log_residuals).mean())
@@ -332,7 +326,6 @@ def train(
         if biased:
             logger.info(f"City-level calibration offsets (>3% bias): {biased}")
 
-    # ── Save model, feature list, holdout data, and metadata ──────────────────
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(best_model, model_path)
     joblib.dump(feature_cols, feature_path)
