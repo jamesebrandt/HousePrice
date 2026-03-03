@@ -53,6 +53,10 @@ COLUMN_MAP = {
     "city":             "city",
     "sold":             "sold",
     "description":      "description",
+    # Some MLS feeds / future Redfin formats may include remarks columns
+    "REMARKS":          "description",
+    "PUBLIC REMARKS":   "description",
+    "DESCRIPTION":      "description",
 }
 
 NUMERIC_COLS = ["price", "beds", "baths", "sqft", "lot_sqft", "year_built",

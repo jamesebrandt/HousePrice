@@ -10,7 +10,6 @@ search:
     - "Mapleton"
     - "Payson"
     - "Elk Ridge"
-    - "Heber City"
     - "Tooele"
     - "Lake Point"
     - "Stansbury Park"
@@ -32,6 +31,8 @@ search:
     - "Fountain Green"
     - "Benjamin"
     - "Heber City"
+    # Note: Heber City is excluded here, so it should NOT appear in cities above.
+    # Wasatch County prices are out of range for the target buyer profile.
 
 
   # All downloaded cities — used only to train the model (more sold data = better predictions)
@@ -51,6 +52,7 @@ search:
     - "Payson"
     - "Elk Ridge"
     - "Salem"
+    - "Santaquin"
     - "Orem"
     - "Provo"
     - "Heber City"

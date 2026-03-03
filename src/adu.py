@@ -37,7 +37,7 @@ _ADU_KEYWORDS = [
     r"separate\s+(entrance|entry|living|unit|apartment|suite|quarters)",
     r"rental\s+(income|unit|suite|potential|opportunity)",
     r"\bkitchenette\b",
-    r"guest\s+(house|suite|quarters|apartment|unit)",
+    r"guest\s+(house|apartment|unit)",
     r"casita",
     r"granny\s+(flat|suite|unit)",
     r"secondary\s+(suite|unit|dwelling|kitchen)",
@@ -81,6 +81,26 @@ _STRONG_KEYWORDS = [
 ]
 _STRONG_PATTERN = re.compile("|".join(_STRONG_KEYWORDS), re.IGNORECASE)
 
+# Signals that a listing is new construction / not yet built — these homes
+# can't have an existing ADU, so confidence is dampened.
+_NEGATIVE_KEYWORDS = [
+    r"ready[\s\-]?to[\s\-]?build",
+    r"new\s+construction",
+    r"to\s+be\s+built",
+    r"under\s+construction",
+    r"pre[\s\-]?sale",
+    r"select\s+your\s+(lot|plan|finishes)",
+    r"floor\s+plan\s+(shows|features|includes|offers)",
+]
+_NEGATIVE_PATTERN = re.compile("|".join(_NEGATIVE_KEYWORDS), re.IGNORECASE)
+
+
+def _has_new_construction_signals(description: str) -> bool:
+    """True if description contains new-construction / not-yet-built language."""
+    if not description or not isinstance(description, str):
+        return False
+    return bool(_NEGATIVE_PATTERN.search(description))
+
 
 def _keyword_score(description: str) -> float:
     """Score 0.0–1.0 based on ADU-related keywords found in listing description."""
@@ -107,13 +127,18 @@ def _structural_score(row: pd.Series) -> float:
     """
     Score 0.0–1.0 based on structural indicators that suggest an ADU.
 
+    Thresholds are calibrated for the Utah market where 5–7 bed homes with
+    finished basements are standard single-family construction.  Only truly
+    unusual room counts and bathroom ratios push the score above 0.3.
+
     Key heuristics:
-      - Excess rooms:  A 9bd/6ba home almost certainly has a separate unit.
-        Normal single-family homes rarely exceed 5bd/3.5ba.
-      - Bath density:  >=1 bath per bed is unusual for single-family.
-      - Large footprint with many rooms: 4000+ sqft with 7+ beds.
+      - Excess rooms:  A 10bd/6ba home (16+ total) almost certainly has
+        a separate unit.  Utah SFH commonly reaches 7bd/4ba (11 total)
+        without any ADU.
       - Excess baths:  More baths than expected for the bed count suggests
         a second full bathroom set (i.e. a separate unit).
+      - Bath density:  >=1 bath per bed is unusual for single-family.
+      - Large footprint with extreme room counts: 5000+ sqft / 8+ beds.
     """
     score = 0.0
     beds = row.get("beds")
@@ -125,32 +150,32 @@ def _structural_score(row: pd.Series) -> float:
 
     total_rooms = beds + baths
 
-    if total_rooms >= 14:
-        score += 0.50
-    elif total_rooms >= 11:
-        score += 0.35
-    elif total_rooms >= 9:
-        score += 0.20
+    if total_rooms >= 16:
+        score += 0.45
+    elif total_rooms >= 14:
+        score += 0.30
+    elif total_rooms >= 12:
+        score += 0.15
 
-    # Normal SFH has ~0.5–0.6 baths/bed; excess suggests a second bathroom set
     if beds > 0:
-        expected_baths = 1.0 + (beds - 1) * 0.5  # e.g. 4bd → 2.5ba expected
+        expected_baths = 1.0 + (beds - 1) * 0.5
         excess_baths = baths - expected_baths
         if excess_baths >= 2.0:
             score += 0.20
         elif excess_baths >= 1.0:
             score += 0.10
 
-    if beds > 0 and baths / beds >= 0.9:
+    if beds > 0 and baths / beds >= 1.0:
+        score += 0.10
+
+    if beds >= 7 and baths >= 5:
         score += 0.10
 
     if pd.notna(sqft):
-        if sqft >= 4000 and beds >= 7:
+        if sqft >= 5000 and beds >= 8:
             score += 0.15
-        elif sqft >= 3500 and beds >= 6:
+        elif sqft >= 4500 and beds >= 7:
             score += 0.10
-        elif sqft >= 3000 and beds >= 5:
-            score += 0.05
 
     return min(score, 1.0)
 
@@ -163,7 +188,14 @@ def detect_adu_potential(df: pd.DataFrame) -> pd.DataFrame:
       - adu_keyword_score:    0–1 from description keywords
       - adu_structural_score: 0–1 from bed/bath/sqft heuristics
       - adu_confidence:       combined score (0–1)
-      - adu_likely:           True if confidence >= 0.3
+      - adu_likely:           True if confidence >= threshold
+
+    Structural-only detections (no keyword match) require a higher confidence
+    bar (>=0.5) because room counts alone are a weaker signal in Utah where
+    5–7 bed homes with finished basements are standard.
+
+    New-construction listings have their confidence halved because they
+    describe a floor plan, not an existing ADU.
     """
     df = df.copy()
 
@@ -174,18 +206,30 @@ def detect_adu_potential(df: pd.DataFrame) -> pd.DataFrame:
 
     df["adu_structural_score"] = df.apply(_structural_score, axis=1)
 
-    # Max of both signals + small bonus when both agree
     kw = df["adu_keyword_score"]
     st = df["adu_structural_score"]
     base = pd.concat([kw, st], axis=1).max(axis=1)
     both_bonus = pd.concat([kw, st], axis=1).min(axis=1) * 0.3
     df["adu_confidence"] = (base + both_bonus).clip(0.0, 1.0)
 
+    # Dampen confidence for new-construction / ready-to-build listings
+    if "description" in df.columns:
+        new_build = df["description"].apply(_has_new_construction_signals)
+        df.loc[new_build, "adu_confidence"] *= 0.5
+
+    # Keyword-backed detections clear the standard 0.3 bar;
+    # structural-only detections need >= 0.5 to avoid flagging normal large homes
+    structural_only = (kw == 0) & (st > 0)
     df["adu_likely"] = df["adu_confidence"] >= 0.3
+    df.loc[structural_only & (df["adu_confidence"] < 0.5), "adu_likely"] = False
 
     n_likely = df["adu_likely"].sum()
     n_keyword = (df["adu_keyword_score"] > 0).sum()
-    n_structural = ((df["adu_keyword_score"] == 0) & (df["adu_structural_score"] >= 0.3)).sum()
+    n_structural = (
+        (df["adu_keyword_score"] == 0)
+        & (df["adu_structural_score"] > 0)
+        & df["adu_likely"]
+    ).sum()
     logger.info(
         f"ADU detection: {n_likely} likely ADU listings "
         f"({n_keyword} keyword-matched, {n_structural} structural-only)"

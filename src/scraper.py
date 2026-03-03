@@ -50,23 +50,43 @@ HEADERS = {
 
 # City → Redfin region ID (region_type 6 = city)
 # IDs sourced from redfin.com/city/<id>/UT/<CityName> URLs.
-# Cities too small for a Redfin city page (Elk Ridge, Lake Point, Stansbury Park,
-# Daniel, Payson UT, Nephi) are covered only by manual CSV download.
+# Cities with no Redfin city page (Elk Ridge, Lake Point, Stansbury Park,
+# Daniel, Payson UT, Salem UT, Erda, Burmester, Nephi) are covered only
+# by manual CSV download — place exports in data/raw/manual/.
 CITY_REGIONS = {
     # Utah County — north
     "Saratoga Springs": {"region_id": "18736", "region_type": "6"},
-    "Eagle Mountain":   {"region_id": "17872", "region_type": "6"},
+    "Eagle Mountain":   {"region_id": "5372",  "region_type": "6"},
     "Lehi":             {"region_id": "18248", "region_type": "6"},
     "American Fork":    {"region_id": "16788", "region_type": "6"},
     "Cedar Hills":      {"region_id": "17262", "region_type": "6"},
     "Highland":         {"region_id": "17971", "region_type": "6"},
-    "Bluffdale":        {"region_id": "17014", "region_type": "6"},
-    "Herriman":         {"region_id": "17963", "region_type": "6"},
-    "Riverton":         {"region_id": "18601", "region_type": "6"},
+    "Alpine":           {"region_id": "111",   "region_type": "6"},
+    "Pleasant Grove":   {"region_id": "15690", "region_type": "6"},
+    "Lindon":           {"region_id": "11486", "region_type": "6"},
+    "Vineyard":         {"region_id": "20183", "region_type": "6"},
+    # Utah County — central (Orem / Provo metro)
+    "Orem":             {"region_id": "14855", "region_type": "6"},
+    "Provo":            {"region_id": "16042", "region_type": "6"},
     # Utah County — south (Spanish Fork corridor)
     "Spanish Fork":     {"region_id": "18207", "region_type": "6"},
+    "Springville":      {"region_id": "18442", "region_type": "6"},
     "Mapleton":         {"region_id": "12244", "region_type": "6"},
     "Santaquin":        {"region_id": "17357", "region_type": "6"},
+    # Salt Lake County
+    "Riverton":         {"region_id": "18601", "region_type": "6"},
+    "Bluffdale":        {"region_id": "17014", "region_type": "6"},
+    "Herriman":         {"region_id": "17963", "region_type": "6"},
+    "South Jordan":     {"region_id": "18112", "region_type": "6"},
+    "Sandy":            {"region_id": "17265", "region_type": "6"},
+    "Draper":           {"region_id": "5189",  "region_type": "6"},
+    "Midvale":          {"region_id": "12749", "region_type": "6"},
+    "Cottonwood Heights": {"region_id": "4227", "region_type": "6"},
+    # Weber / Davis County
+    "Ogden":            {"region_id": "14490", "region_type": "6"},
+    "Clearfield":       {"region_id": "3598",  "region_type": "6"},
+    "Syracuse":         {"region_id": "18971", "region_type": "6"},
+    "West Haven":       {"region_id": "20566", "region_type": "6"},
     # Wasatch County
     "Heber City":       {"region_id": "8736",  "region_type": "6"},  # Redfin page: "Heber"
     # Tooele County
@@ -390,22 +410,67 @@ def _save_description_cache(cache: dict) -> None:
     cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _fetch_description_from_html(url: str) -> str | None:
+    """
+    Fallback: fetch a listing's description from the page's JSON-LD block.
+
+    Redfin embeds a <script type="application/ld+json"> block with
+    @type ["Product", "RealEstateListing"] containing the full agent remarks
+    in a "description" field. This works even when the Stingray API returns 403.
+    """
+    full_url = url if url.startswith("http") else REDFIN_BASE + url
+    try:
+        resp = requests.get(full_url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.debug(f"HTML fetch failed for {url}: {e}")
+        return None
+
+    for block in re.findall(
+        r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+        resp.text,
+        re.DOTALL,
+    ):
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+
+        types = data.get("@type", [])
+        if isinstance(types, str):
+            types = [types]
+        if not {"RealEstateListing", "Product"}.intersection(types):
+            continue
+
+        desc = data.get("description")
+        if desc and isinstance(desc, str) and len(desc) > 10:
+            return desc
+
+    return None
+
+
 def _fetch_one_description(raw_url: str) -> str | None:
     """
     Fetch a single listing description given its full Redfin URL.
     Returns the description text, or None on failure.
-    Sleeps after the request to rate-limit per worker.
+
+    Strategy: try the Stingray belowTheFold API first (fast, structured).
+    If that fails, fall back to scraping the JSON-LD block from the listing
+    page HTML (slower but resilient to API 403 blocks).
     """
     url_path = raw_url
     if "redfin.com" in url_path:
         url_path = url_path.split("redfin.com", 1)[1]
 
     property_id, _ = _get_property_id(url_path)
-    if property_id is None:
-        time.sleep(DESCRIPTION_SLEEP_FAILURE)
-        return None
+    if property_id is not None:
+        desc = _get_listing_description(property_id)
+        if desc:
+            time.sleep(DESCRIPTION_SLEEP)
+            return desc
 
-    desc = _get_listing_description(property_id)
+    # Stingray path failed — try HTML JSON-LD fallback
+    desc = _fetch_description_from_html(raw_url)
     time.sleep(DESCRIPTION_SLEEP)
     return desc
 
