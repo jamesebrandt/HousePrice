@@ -14,17 +14,26 @@ search:
     - "Tooele"
     - "Lake Point"
     - "Stansbury Park"
+    - "Riverton"
+    - "Syracuse"
+    - "Clearfield"
+    - "West Haven"
+    - "Ogden"
+    - "South Jordan"
+    - "Alpine"
+    - "Herriman"
+    - "Bluffdale"
+    - "Sandy"
+    - "Draper"
+
   state: "UT"
   # Cities to exclude from training and scoring (outliers or places you don't care about)
   exclude_cities:
     - "Fountain Green"
     - "Benjamin"
-    # Weber County cities are north of SLC — outside the SLC-to-Nephi search corridor.
-    # Their price dynamics differ enough to add noise rather than signal.
-    - "West Haven"
-    - "Ogden"
-    - "Syracuse"
-    - "Clearfield"
+    - "Heber City"
+
+
   # All downloaded cities — used only to train the model (more sold data = better predictions)
   training_cities:
     - "Saratoga Springs"
@@ -58,6 +67,10 @@ search:
     - "Herriman"
     - "South Jordan"
     - "Alpine"
+    - "Sandy"
+    - "Draper"
+    - "Midvale"
+    - "Cottonwood Heights"
 
 training:
   # Cap training data to homes at or below this price. Homes well above
@@ -69,7 +82,7 @@ criteria:
   max_price: 800000
   min_beds: 3
   min_baths: 2.0
-  min_sqft: 1800
+  min_sqft: 1600
   max_year_built: null          # set to e.g. 2000 if you want only homes built after 2000
   max_home_age_years: 35        # no homes older than 35 years — set to null to remove this filter
   min_lot_sqft: 5000
@@ -77,7 +90,7 @@ criteria:
 
 scoring:
   min_value_score: 0.05         # flag homes priced 5%+ below predicted value
-  top_n_alerts: 5               # include top N homes in each email alert
+  top_n_alerts: 15               # include top N homes in each email alert
 
 adu:
   enabled: true
@@ -89,13 +102,13 @@ adu:
   # Default monthly ADU rent when ZIP-level data isn't available.
   default_adu_rent: 1000
   # Max listings to fetch descriptions for (Redfin detail API, ~1.5s each).
-  max_description_fetches: 200
+  max_description_fetches: 700
   # Minimum ADU confidence to flag a listing (0.0–1.0).
   min_adu_confidence: 0.3
 
 notifications:
-  email_to: "your@email.com"    # EDIT THIS
-  email_from: "alerts@gmail.com" # EDIT THIS — use an App Password, not your real password
+  email_to: "pintothegreat1@gmail.com"
+  email_from: "pintothegreat3@gmail.com"
 
 # How stale each data source can be before an alert email is sent.
 # Set a value to null to disable alerts for that source.

@@ -14,6 +14,12 @@ Usage:
   # Just print to console, skip email:
   python main.py --run-now --no-email
 
+  # Auto-refetch if cache is older than 18 hours:
+  python main.py --run-now --max-cache-age 18
+
+  # Auto-download latest BPS/ZHVI before running:
+  python main.py --run-now --refetch --update-feeds
+
   # Use a custom config file:
   python main.py --run-now --config my_config.yaml
 """
@@ -23,7 +29,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import schedule
 
@@ -37,7 +43,47 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_email: bool = True, use_sample: bool = False, refetch: bool = False, export_report: bool = True):
+HEALTHCHECK_LOG = Path("logs/healthcheck.log")
+
+
+def _write_healthcheck(run_start: datetime, config: dict) -> None:
+    """Append a one-line heartbeat to logs/healthcheck.log."""
+    HEALTHCHECK_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(HEALTHCHECK_LOG, "a") as f:
+        f.write(f"{run_start.isoformat()} — pipeline started\n")
+    logger.info(f"Healthcheck logged to {HEALTHCHECK_LOG}")
+
+
+def _send_healthcheck_email(run_start: datetime, config: dict) -> None:
+    """Send a lightweight 'I'm alive' email at run start (best-effort, no crash on failure)."""
+    notif = config.get("notifications", {})
+    email_to = notif.get("email_to")
+    email_from = notif.get("email_from")
+    if not email_to or not email_from or email_to == "your@email.com":
+        return
+    try:
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        app_pw = os.getenv("GMAIL_APP_PASSWORD")
+        if not app_pw:
+            return
+        import yagmail
+        yag = yagmail.SMTP(email_from, app_pw)
+        yag.send(
+            to=email_to,
+            subject=f"Home Finder heartbeat — {run_start.strftime('%b %d %H:%M')}",
+            contents=(
+                f"Pipeline run started at {run_start.strftime('%Y-%m-%d %H:%M')}.\n"
+                "You'll receive a deals email shortly if any are found."
+            ),
+        )
+        logger.info("Healthcheck email sent.")
+    except Exception as e:
+        logger.debug(f"Healthcheck email failed (non-fatal): {e}")
+
+
+def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_email: bool = True, use_sample: bool = False, refetch: bool = False, export_report: bool = True, max_cache_age_hours: float | None = None):
     """
     Full pipeline:
       1. Fetch fresh listings from Redfin
@@ -75,9 +121,15 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     email_to        = notif_cfg.get("email_to")
     email_from      = notif_cfg.get("email_from")
 
+    run_start = datetime.now()
     logger.info("=" * 60)
-    logger.info(f"Home Finder run started: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    logger.info(f"Home Finder run started: {run_start.strftime('%Y-%m-%d %H:%M')}")
     logger.info("=" * 60)
+
+    # ── Healthcheck: log to file + optional email so you know the scheduler fired
+    _write_healthcheck(run_start, config)
+    if send_email:
+        _send_healthcheck_email(run_start, config)
 
     search_cfg      = config.get("search", {})
     training_cities = search_cfg.get("training_cities", search_cfg.get("cities", []))
@@ -89,6 +141,16 @@ def run_pipeline(config_path: str = "config.yaml", retrain: bool = False, send_e
     cached_csvs = list(Path(raw_dir).glob("*.csv"))
     if refetch:
         cached_csvs = []
+    elif max_cache_age_hours is not None and cached_csvs:
+        cutoff = datetime.now() - timedelta(hours=max_cache_age_hours)
+        newest_mtime = max(f.stat().st_mtime for f in cached_csvs)
+        newest_dt = datetime.fromtimestamp(newest_mtime)
+        if newest_dt < cutoff:
+            logger.info(
+                f"Cache is {(datetime.now() - newest_dt).total_seconds() / 3600:.1f}h old "
+                f"(max-cache-age={max_cache_age_hours}h) — treating as stale."
+            )
+            cached_csvs = []
 
     if use_sample:
         logger.info("Generating sample data (--use-sample flag).")
@@ -282,6 +344,10 @@ def main():
     parser.add_argument("--no-report", action="store_true", help="Skip saving the HTML report to reports/.")
     parser.add_argument("--use-sample", action="store_true", help="Use generated sample data instead of live Redfin fetch.")
     parser.add_argument("--refetch", action="store_true", help="Force live Redfin API fetch even if cached CSVs exist.")
+    parser.add_argument("--max-cache-age", type=float, default=None, metavar="HOURS",
+                        help="Auto-refetch if cached CSVs are older than HOURS (e.g. 18). Ignored when --refetch is set.")
+    parser.add_argument("--update-feeds", action="store_true",
+                        help="Auto-download latest BPS/ZHVI/ACS data before running the pipeline.")
     parser.add_argument("--serve", action="store_true", help="Serve the HTML report locally after running.")
     parser.add_argument("--config", default="config.yaml", help="Path to config YAML (default: config.yaml).")
     parser.add_argument("--time", default="07:00", help="Daily run time in HH:MM format (default: 07:00).")
@@ -291,11 +357,19 @@ def main():
     use_sample_flag = args.use_sample
     refetch_flag = args.refetch
     export_report_flag = not args.no_report
+    max_cache_age = args.max_cache_age
+
+    if args.update_feeds:
+        from src.feed_updater import update_all_feeds
+        config = load_config(args.config)
+        raw_dir = config.get("paths", {}).get("raw_data_dir", "data/raw")
+        update_all_feeds(raw_dir)
 
     if args.run_now:
         run_pipeline(config_path=args.config, retrain=args.retrain,
                      send_email=send_email_flag, use_sample=use_sample_flag,
-                     refetch=refetch_flag, export_report=export_report_flag)
+                     refetch=refetch_flag, export_report=export_report_flag,
+                     max_cache_age_hours=max_cache_age)
 
     if args.serve:
         import http.server
@@ -340,16 +414,24 @@ def main():
             logger.error(f"Could not find an open port between {start_port} and {end_port}. Please free up a port and try again.")
 
     if args.schedule:
-        schedule.every().day.at(args.time).do(
-            run_pipeline,
-            config_path=args.config,
-            retrain=False,
-            send_email=send_email_flag,
-            use_sample=use_sample_flag,
-            refetch=True,   # always pull fresh Redfin listings on scheduled runs
-            export_report=export_report_flag,
-        )
-        logger.info(f"Scheduler started. Will refetch + run daily at {args.time}. Press Ctrl+C to stop.")
+        def _scheduled_run():
+            if args.update_feeds:
+                from src.feed_updater import update_all_feeds
+                cfg = load_config(args.config)
+                update_all_feeds(cfg.get("paths", {}).get("raw_data_dir", "data/raw"))
+            run_pipeline(
+                config_path=args.config,
+                retrain=False,
+                send_email=send_email_flag,
+                use_sample=use_sample_flag,
+                refetch=True,
+                export_report=export_report_flag,
+                max_cache_age_hours=max_cache_age,
+            )
+
+        schedule.every().day.at(args.time).do(_scheduled_run)
+        feeds_note = " (with feed updates)" if args.update_feeds else ""
+        logger.info(f"Scheduler started. Will refetch + run daily at {args.time}{feeds_note}. Press Ctrl+C to stop.")
         try:
             while True:
                 schedule.run_pending()

@@ -21,6 +21,7 @@ manually downloaded CSVs are strongly preferred over the live API.
 """
 
 import io
+import re
 import json
 import time
 import logging
@@ -553,9 +554,89 @@ def _read_listing_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False, on_bad_lines="skip")
 
 
+def _clean_city_name(city: str) -> str:
+    """
+    Strip garbled prefixes that occasionally appear in Redfin CSV exports.
+
+    Redfin sometimes prepends garbage characters to the CITY field, e.g.
+    "Ju2rsr Draper" instead of "Draper". We extract the last run of
+    properly Title-Cased word(s) from the string and use that as the city name.
+
+    Examples:
+        "Ju2rsr Draper"      → "Draper"
+        "Sandy"              → "Sandy"
+        "Cottonwood Heights" → "Cottonwood Heights"
+        "South Jordan"       → "South Jordan"
+    """
+    if not isinstance(city, str):
+        return city
+    m = re.search(r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)$", city.strip())
+    return m.group(1) if m else city.strip()
+
+
+def _load_manual_drop_in(raw_dir: str) -> list[pd.DataFrame]:
+    """
+    Load CSVs from the data/raw/manual/ drop-in folder.
+
+    This folder is the ingestion path for cities without Redfin region IDs
+    (Elk Ridge, Lake Point, Stansbury Park, Daniel, Payson, Nephi, etc.).
+    Place Redfin CSV exports here; they'll be picked up on every run.
+
+    Subfolder-per-city convention:
+        data/raw/manual/elk_ridge/active.csv
+        data/raw/manual/elk_ridge/sold.csv
+        data/raw/manual/payson/redfin_2026-03-01.csv
+    Or just drop CSVs directly:
+        data/raw/manual/elk_ridge_active.csv
+    """
+    manual_dir = Path(raw_dir) / "manual"
+    if not manual_dir.exists():
+        return []
+
+    frames = []
+    csv_files = list(manual_dir.rglob("*.csv"))
+    if not csv_files:
+        return []
+
+    logger.info(f"Loading {len(csv_files)} CSV(s) from manual drop-in folder...")
+    for f in sorted(csv_files):
+        try:
+            df = _read_listing_csv(f)
+
+            listing_signals = {"PRICE", "BEDS", "SALE TYPE", "price", "beds"}
+            if not listing_signals.intersection(df.columns):
+                logger.info(f"Skipping manual/{f.relative_to(manual_dir)} — not a listing CSV.")
+                continue
+
+            if "city" not in df.columns and "CITY" not in df.columns:
+                # Derive city name from parent folder or filename
+                if f.parent != manual_dir:
+                    name = f.parent.name.replace("_", " ").title()
+                else:
+                    name = (f.stem
+                            .replace("_active", "").replace("_sold", "")
+                            .replace("_and_", " & ").replace("_", " ")
+                            .title())
+                df["city"] = name
+            elif "CITY" in df.columns:
+                df["CITY"] = df["CITY"].map(_clean_city_name)
+
+            if "sold" not in df.columns:
+                df["sold"] = "_sold" in f.stem.lower() or "sold" in f.stem.lower()
+
+            frames.append(df)
+            logger.info(f"  manual/{f.relative_to(manual_dir)}: {len(df):,} rows")
+        except Exception as e:
+            logger.warning(f"Could not load manual/{f.relative_to(manual_dir)}: {e}")
+
+    return frames
+
+
 def load_all_raw_csv(raw_dir: str = "data/raw") -> pd.DataFrame:
     """
-    Load and concatenate all listing CSV files in raw_dir (top-level only).
+    Load and concatenate all listing CSV files in raw_dir (top-level only)
+    plus any CSVs in the manual/ drop-in subfolder.
+
     Skips subdirectories (BPS Data, discarded, Downloaded Data, etc.) and
     the old combined all_listings_raw.csv to avoid double-counting.
     """
@@ -569,11 +650,6 @@ def load_all_raw_csv(raw_dir: str = "data/raw") -> pd.DataFrame:
         combined_path = Path(raw_dir) / "all_listings_raw.csv"
         if combined_path.exists():
             csv_files = [combined_path]
-        else:
-            raise FileNotFoundError(
-                f"No CSV files found in {raw_dir}.\n"
-                "Download listing CSVs from redfin.com — see data/DOWNLOAD_GUIDE.md."
-            )
 
     frames = []
     for f in sorted(csv_files):
@@ -600,8 +676,15 @@ def load_all_raw_csv(raw_dir: str = "data/raw") -> pd.DataFrame:
         except Exception as e:
             logger.warning(f"Could not load {f.name}: {e}")
 
+    # Also load the manual drop-in folder for uncovered cities
+    manual_frames = _load_manual_drop_in(raw_dir)
+    frames.extend(manual_frames)
+
     if not frames:
-        raise FileNotFoundError(f"No readable CSV files in {raw_dir}.")
+        raise FileNotFoundError(
+            f"No CSV files found in {raw_dir} or {raw_dir}/manual/.\n"
+            "Download listing CSVs from redfin.com — see data/DOWNLOAD_GUIDE.md."
+        )
 
     combined = pd.concat(frames, ignore_index=True)
     logger.info(f"Total rows loaded: {len(combined):,}")
